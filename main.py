@@ -25,6 +25,6 @@ def tradingview_webhook():
     time = data.get("time")
 
     # TODO: process alert, call Grok, send notification, etc.
-    print(f"Alert: {ticker} {signal} @ {price} ({interval})")
+    print(f"Alert: {time} {ticker} {signal} @ {price} ({interval})")
 
     return jsonify({"status": "received"}), 200
