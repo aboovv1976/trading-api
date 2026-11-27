@@ -19,6 +19,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
 RESULT_TTL = 7 * 24 * 60 * 60
 LOCK_TTL = 120  # Longer than the configured 60-second Vercel invocation.
+RESULTS_PATH = "/api/v1/results-8dc2a850b73dc31d"
 
 # A timed-out worker cannot release another delivery's lock or overwrite its result.
 RELEASE = """
@@ -184,7 +185,44 @@ def analysis_worker():
             store.close()
 
 
-@app.get("/api/v1/results/<job_id>")
+@app.get(RESULTS_PATH)
+def list_results():
+    if not configured("RESULT_API_TOKEN", "REDIS_URL"):
+        return jsonify(error="Server misconfigured"), 503
+    if not bearer_authorized("RESULT_API_TOKEN"):
+        return jsonify(error="Unauthorized"), 401
+    cursor_text = request.args.get("cursor", "0")
+    count_text = request.args.get("count", "20")
+    if (
+        not cursor_text.isascii() or not cursor_text.isdecimal()
+        or len(cursor_text) > 20 or int(cursor_text) > 2**64 - 1
+        or not count_text.isascii() or not count_text.isdecimal()
+        or len(count_text) > 2 or not 1 <= int(count_text) <= 50
+    ):
+        return jsonify(error="Use a valid cursor and count between 1 and 50"), 400
+    try:
+        with redis_client() as store:
+            # SCAN avoids blocking Redis with KEYS or reading every result at once.
+            # COUNT is a work hint, not an exact page size. Cursor 0 means done.
+            next_cursor, keys = store.scan(
+                cursor=int(cursor_text), match="tv:*:result", count=int(count_text),
+            )
+            values = []
+            if keys:
+                # Independent GETs work across hash slots; avoid multi-key MGET.
+                with store.pipeline(transaction=False) as pipeline:
+                    for key in keys:
+                        pipeline.get(key)
+                    values = pipeline.execute()
+        # A result can expire between SCAN and GET. Skip it without failing a page.
+        results = [json.loads(value) for value in values if value is not None]
+        return jsonify(results=results, next_cursor=str(next_cursor)), 200
+    except Exception as exc:
+        app.logger.error("Result listing failed (%s)", type(exc).__name__)
+        return jsonify(error="Storage unavailable"), 503
+
+
+@app.get(RESULTS_PATH + "/<job_id>")
 def get_result(job_id):
     if not configured("RESULT_API_TOKEN", "REDIS_URL"):
         return jsonify(error="Server misconfigured"), 503

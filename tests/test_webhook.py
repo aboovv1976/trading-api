@@ -130,7 +130,7 @@ def test_worker_stores_result_and_suppresses_duplicates(client, payload, monkeyp
     assert first.status_code == second.status_code == 200
     assert second.json["duplicate"] is True
     run.assert_called_once()
-    url = "/api/v1/results/" + first.json["job_id"]
+    url = main.RESULTS_PATH + "/" + first.json["job_id"]
     assert client.get(url).status_code == 401
     response = client.get(url, headers={"Authorization": "Bearer result-test"})
     assert response.status_code == 200
@@ -435,3 +435,89 @@ def test_missing_volume_is_accepted_as_unknown(client, rich_payload):
     rich_payload.update(volume=None, avgVol20=None)
     assert client.post(WEBHOOK, json=rich_payload).status_code == 202
     assert main.publish.call_args.args[0].volume is None
+
+
+RESULT_AUTH = {"Authorization": "Bearer result-test"}
+
+
+def test_listing_traverses_all_completed_results(client):
+    expected = set()
+    with main.redis_client() as store:
+        for index in range(75):
+            job_id = f"{index:064x}"
+            expected.add(job_id)
+            store.set("tv:{" + job_id + "}:result", json.dumps({"job_id": job_id, "analysis": {"decision": "Watch"}}), ex=100)
+            store.set("tv:{" + job_id + "}:lock", "owner", ex=100)
+        store.set("unrelated:data", "not a result")
+    found = set()
+    cursor = "0"
+    for _ in range(100):
+        response = client.get(main.RESULTS_PATH, query_string={"count": "7", "cursor": cursor}, headers=RESULT_AUTH)
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
+        assert all(record["analysis"]["decision"] == "Watch" for record in response.json["results"])
+        found.update(record["job_id"] for record in response.json["results"])
+        cursor = response.json["next_cursor"]
+        assert isinstance(cursor, str)
+        if cursor == "0":
+            break
+    else:
+        pytest.fail("Listing did not finish")
+    assert found == expected
+
+
+def test_empty_result_listing(client):
+    response = client.get(main.RESULTS_PATH, headers=RESULT_AUTH)
+    assert response.status_code == 200
+    assert response.json == {"results": [], "next_cursor": "0"}
+
+
+@pytest.mark.parametrize("suffix", ["", "/" + "a" * 64])
+def test_both_result_routes_require_result_token(client, suffix):
+    assert client.get(main.RESULTS_PATH + suffix).status_code == 401
+    assert client.get(main.RESULTS_PATH + suffix, headers=AUTH).status_code == 401
+
+
+@pytest.mark.parametrize("query", [
+    {"cursor": "-1"}, {"cursor": "abc"}, {"cursor": "1.5"},
+    {"cursor": str(2**64)}, {"cursor": ""}, {"cursor": "١"},
+    {"count": "0"}, {"count": "51"}, {"count": "abc"}, {"count": "1.5"},
+])
+def test_listing_rejects_invalid_pagination(client, query):
+    assert client.get(main.RESULTS_PATH, query_string=query, headers=RESULT_AUTH).status_code == 400
+
+
+def test_listing_skips_results_expired_during_scan(client, monkeypatch):
+    store = main.redis_client()
+    key = "tv:{" + "a" * 64 + "}:result"
+    store.set(key, '{"job_id": "expired"}')
+    real_scan = store.scan
+
+    def scan_then_expire(**kwargs):
+        result = real_scan(**kwargs)
+        store.delete(key)
+        return result
+
+    monkeypatch.setattr(store, "scan", scan_then_expire)
+    monkeypatch.setattr(main, "redis_client", lambda: store)
+    response = client.get(main.RESULTS_PATH, headers=RESULT_AUTH)
+    assert response.status_code == 200
+    assert response.json["results"] == []
+
+
+@pytest.mark.parametrize("suffix", ["", "/" + "a" * 64])
+def test_result_storage_errors_are_redacted(client, monkeypatch, suffix):
+    monkeypatch.setattr(main, "redis_client", MagicMock(side_effect=ConnectionError("private credentials")))
+    response = client.get(main.RESULTS_PATH + suffix, headers=RESULT_AUTH)
+    assert response.status_code == 503
+    assert "private credentials" not in response.text
+
+
+def test_specific_result_validation_and_missing_record(client):
+    assert client.get(main.RESULTS_PATH + "/invalid", headers=RESULT_AUTH).status_code == 400
+    assert client.get(main.RESULTS_PATH + "/" + "a" * 64, headers=RESULT_AUTH).status_code == 404
+
+
+def test_old_result_routes_removed(client):
+    assert client.get("/api/v1/results", headers=RESULT_AUTH).status_code == 404
+    assert client.get("/api/v1/results/" + "a" * 64, headers=RESULT_AUTH).status_code == 404

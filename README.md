@@ -168,7 +168,7 @@ Fetch a completed result from a trusted client:
 ```bash
 curl --fail-with-body \
   -H "Authorization: Bearer $RESULT_API_TOKEN" \
-  "https://YOUR_DOMAIN/api/v1/results/JOB_ID"
+  "https://YOUR_DOMAIN/api/v1/results-8dc2a850b73dc31d/JOB_ID"
 ```
 
 Results contain the normalized alert, completion timestamp, and structured
@@ -178,6 +178,33 @@ with `stop_loss < buy_price < sell_target`. Invalid or incomplete model response
 fail the worker and are retried. Results expire after seven days. `404` means
 not available: queued, failed, unknown, and expired jobs are not distinguished.
 `GET /` reports application liveness only, not downstream service health.
+
+### List completed results
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $RESULT_API_TOKEN" \
+  "https://YOUR_DOMAIN/api/v1/results-8dc2a850b73dc31d?count=20&cursor=0"
+```
+
+The response is `{"results": [...], "next_cursor": "..."}`. Each entry contains
+the same complete record returned by the single-result endpoint. For all results,
+repeat the request with the returned `next_cursor` until it is `"0"`. An empty
+page with a nonzero cursor is not the end. `count` accepts 1–50 (default 20) and
+is a Redis SCAN work hint, not an exact page-size limit. Keep the cursor as a
+string; do not round it through JavaScript's numeric type.
+
+Listing is unordered and not a snapshot. Redis SCAN may return duplicates, so
+deduplicate by `job_id` when collecting pages. Concurrent additions/expirations
+can change the listing during traversal. Only completed, unexpired results are
+included; locks, queued jobs, and failed jobs are not listed. Use a small `count`
+when records are large. Redis errors return a generic `503`.
+
+Both result routes require `Authorization: Bearer <RESULT_API_TOKEN>` and use the
+randomized `results-8dc2a850b73dc31d` prefix. The old `/api/v1/results/...` path
+is removed. The prefix reduces discovery; bearer-token authentication is still
+required. Deploy the updated code and update any result API consumers; no new
+environment variable or Redis migration is needed.
 
 ## Reliability and operations
 
