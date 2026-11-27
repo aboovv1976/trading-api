@@ -1,31 +1,224 @@
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fvercel%2Ftree%2Fmain%2Fexamples%2Fflask&demo-title=Flask%20API&demo-description=Use%20Flask%20API%20on%20Vercel%20with%20Serverless%20Functions%20using%20the%20Python%20Runtime.&demo-url=https%3A%2F%2Fvercel-plus-flask.vercel.app%2F&demo-image=https://assets.vercel.com/image/upload/v1669994600/random/python.png)
+# TradingView analysis webhook
 
-# Flask + Vercel
+Flask API for Vercel. The TradingView endpoint authenticates and validates an
+alert, publishes it to QStash, then returns `202` with a `job_id`. A separately
+invoked worker asks Grok to research market data using Web Search, performs
+analysis, and stores the result in Redis for seven days.
+There are no detached threads or model requests in the ingress endpoint.
 
-This example shows how to use Flask on Vercel with Serverless Functions using the [Python Runtime](https://vercel.com/docs/concepts/functions/serverless-functions/runtimes/python).
-
-## Demo
-
-https://vercel-plus-flask.vercel.app/
-
-## How it Works
-
-This example uses the Web Server Gateway Interface (WSGI) with Flask to handle requests on Vercel with Serverless Functions.
-
-## Running Locally
-
-```bash
-npm i -g vercel
-python -m venv .venv
-source .venv/bin/activate
-uv sync  # or alternatively pip install flask gunicorn
-gunicorn main:app
+```text
+TradingView -> webhook -> QStash -> authenticated worker -> Grok + Web Search -> Redis
+                                                               ^
+                                     authenticated results API |
 ```
 
-Your Flask application is now available at `http://localhost:3000`.
+## Services and deployment
 
-## One-Click Deploy
+Provision a [QStash](https://upstash.com/docs/qstash/overall/getstarted) account
+and a persistent Redis database (Upstash Redis with its TLS Redis URL works).
+This code does not provision services or deploy anything automatically.
 
-Deploy the example using [Vercel](https://vercel.com?utm_source=github&utm_medium=readme&utm_campaign=vercel-examples):
+Configure these variables in the Vercel project; `.env.example` lists them:
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fvercel%2Ftree%2Fmain%2Fexamples%2Fflask&demo-title=Flask%20API&demo-description=Use%20Flask%20API%20on%20Vercel%20with%20Serverless%20Functions%20using%20the%20Python%20Runtime.&demo-url=https%3A%2F%2Fvercel-plus-flask.vercel.app%2F&demo-image=https://assets.vercel.com/image/upload/v1669994600/random/python.png)
+| Variable | Purpose |
+| --- | --- |
+| `TV_WEBHOOK_SECRET` | Dedicated shared webhook token; never a broker password or API key |
+| `QSTASH_TOKEN` | QStash publish API credential |
+| `QSTASH_URL` | Regional API base URL copied from your QStash console |
+| `WORKER_TOKEN` | Separate random token forwarded by QStash to the worker |
+| `WORKER_URL` | Exact production HTTPS URL ending in `/api/v1/analyze-e8f8323f5eecdfce`; no query or redirect |
+| `REDIS_URL` | Persistent database connection URL, preferably `rediss://…` |
+| `RESULT_API_TOKEN` | Separate random token for reading stored results |
+| `XAI_API_KEY` | xAI API credential, available only to the server |
+| `XAI_MODEL` | Optional; defaults to `grok-4.7`; must support Responses API, Web Search, and structured outputs |
+
+Generate distinct random tokens, for example with `openssl rand -hex 32`.
+Do not commit `.env` or actual credentials. `BACKGROUND_ANALYSIS` is no longer used.
+
+Deploy this repository as a Flask project on Vercel. `pyproject.toml` explicitly
+identifies `main:app`; `.python-version` selects Python 3.12. `vercel.json` sets
+the function maximum duration to 60 seconds. Ensure your Vercel plan supports
+that duration. Use a stable production domain for `WORKER_URL`. TradingView
+must reach the webhook and QStash must reach the worker; configure Vercel
+Deployment Protection accordingly. Application authentication remains required.
+
+QStash uses the configured service URL and forwards `WORKER_TOKEN` as a bearer token.
+The worker route has a random suffix to reduce unsolicited traffic; the bearer
+token remains required. When changing this path, update `WORKER_URL` and deploy
+the matching code together. Previously queued jobs retain their original URLs;
+let them drain before changing the path, or replay them to the new path afterward.
+The worker authenticates this token rather than validating QStash signatures;
+any holder of that token can invoke it. Keep it separate from the TradingView token.
+
+## TradingView alert message
+
+Use the production URL `/api/v1/tv-alert-x7k9m2p` and valid JSON:
+
+```json
+{
+  "secret": "YOUR_DEDICATED_WEBHOOK_TOKEN",
+  "alert_id": "my-strategy-v1:{{exchange}}:{{ticker}}:{{interval}}:{{time}}:green",
+  "ticker": "{{exchange}}:{{ticker}}",
+  "signal": "green",
+  "price": "{{close}}",
+  "interval": "{{interval}}",
+  "time": "{{timenow}}"
+}
+```
+
+Use `red` for the opposite signal and change its `alert_id` accordingly.
+`alert_id` is optional: without it, normalized alert content determines the job
+ID. With it, the ID must identify exactly one event with identical payload data
+on retries. Include a strategy identifier and, if multiple events can occur in
+one bar, an event sequence or other unique value generated by your script.
+Some placeholders depend on alert type; inspect an actual TradingView payload.
+
+Required fields: `ticker`, `signal` (`green` or `red`), positive finite `price`,
+`interval`, and ISO 8601 `time` including timezone. Numeric price strings are
+accepted. Unknown fields, invalid JSON, nonobject JSON, and
+bodies over 128 KiB are rejected. Alerts must be no older than 24 hours and no
+more than five minutes in the future.
+
+### Supertrend + ADX indicator
+
+Use [tradingview/supertrend_adx.pine](tradingview/supertrend_adx.pine) for the
+rich alert format. Paste the file into TradingView's Pine Editor, save it, and
+add it to the desired standard OHLC chart. In the indicator settings, set the
+webhook token to the same value as Vercel's `TV_WEBHOOK_SECRET`. Use a different
+strategy ID for each parameter set. Keep generated alert IDs within 128 characters.
+
+Create an alert on this indicator with **Any alert() function call**, and set
+the webhook URL to the production endpoint above. The script builds its JSON
+message dynamically; you do not paste a separate JSON message or use placeholders.
+Both green and red signals are delivered through this one alert, only after bar
+close with ADX above the configured threshold. Changing the script or settings
+requires recreating the TradingView alert, which uses a saved snapshot.
+
+The script uses `alert()` because `alertcondition()` requires a constant message
+and cannot concatenate runtime `str.tostring()` values. See
+[TradingView's alert documentation](https://www.tradingview.com/pine-script-docs/v5/concepts/alerts/).
+It sends the signal bar's OHLCV, Supertrend, ADX, 20-bar high/low and averages,
+plus five previous closes (newest first). Missing numeric values become JSON
+`null`; alerts wait for indicator warmup. No candle array is sent. The script
+does not backfill signals that occurred before the indicator warmed up.
+
+The API accepts these optional fields: `open`, `high`, `low`, `close`, `volume`,
+`supertrend`, `adx`, `highest20`, `lowest20`, `avgVol20`, `avgClose20`, and
+`prevCloses`. If `price` is absent, `close` supplies it; when both are present they
+must match. ADX must be in [0, 100], volume must be nonnegative, supplied OHLC
+values must have consistent ranges, and `prevCloses` must have five entries.
+Grok receives these values as sender-supplied context and still performs Web Search.
+
+Pine compilation and actual alert delivery must be verified in TradingView;
+the local test suite verifies the corresponding API payload and analysis input.
+
+### Market evidence
+
+TradingView only needs to send the alert above. **No candles are required.**
+The worker uses xAI's Responses API with its server-side `web_search` tool to
+let Grok find historical prices/OHLCV, technical evidence, and relevant news
+and sentiment before producing a structured recommendation. No additional
+market-data API key is required for this search-based approach. xAI model and
+search usage are billed by xAI.
+
+Set `XAI_MODEL=grok-4.7` or another model documented to support these features.
+If you previously set `grok-4`, update the Vercel variable and redeploy; an
+explicit environment value overrides the new default. Search runs on xAI's
+servers; there is no local browser or exchange connection in this application.
+See [Web Search](https://docs.x.ai/developers/tools/web-search) and
+[structured outputs with tools](https://docs.x.ai/developers/model-capabilities/text/structured-outputs).
+
+The model must resolve the instrument/exchange/currency and obtain sufficient
+evidence for the alert's timeframe. It must disclose missing history, delayed
+quotes, and timeframe substitutions, and must not fabricate candles or indicators.
+Sources include a URL, title, category, and observation/publication timestamp
+(`as_of`, or null if unknown).
+
+The application checks that a Web Search call completed and matches model-listed
+source URLs against API-provided citation metadata. A recommendation requires the
+model to report sufficient market evidence and at least one cited market-data
+source timestamped within seven days of research time (allowing five minutes of
+clock skew). Otherwise it stores `Watch` with null price levels. Uncited source
+URLs also force `Watch`. Source lists remain available for review.
+
+These checks establish search provenance, not independent verification of source
+content, timestamps, OHLCV completeness, or the model's interpretation. The
+seven-day limit is a coarse maximum allowing market closures; the prompt requires
+freshness appropriate to the actual instrument and timeframe. Web Search cannot
+guarantee complete intraday candles or exchange-quality real-time quotes. If data
+cannot be found, `Watch` is the expected result. The API never places trades.
+
+The alert schema has no `candles` field. Grok retrieves its own market evidence
+through Web Search.
+
+## Responses and result retrieval
+
+Ingress returns `202` only after QStash acknowledges publication:
+
+```json
+{"status":"accepted","job_id":"<64-character SHA-256 ID>"}
+```
+
+Invalid input returns `400`, authentication failures `401`, oversized bodies
+`413`, and missing configuration or publication failure `503`. No provider
+exception details or webhook secrets are returned or intentionally logged.
+
+Fetch a completed result from a trusted client:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $RESULT_API_TOKEN" \
+  "https://YOUR_DOMAIN/api/v1/results/JOB_ID"
+```
+
+Results contain the normalized alert, completion timestamp, and structured
+analysis: `decision`, `buy_price`, `stop_loss`, `sell_target`, `time_limit`,
+`rationale`, `limitations`, `market_data_sufficient`, and `sources`. A `Buy` response requires positive price levels
+with `stop_loss < buy_price < sell_target`. Invalid or incomplete model responses
+fail the worker and are retried. Results expire after seven days. `404` means
+not available: queued, failed, unknown, and expired jobs are not distinguished.
+`GET /` reports application liveness only, not downstream service health.
+
+## Reliability and operations
+
+- TradingView allows only [three seconds](https://www.tradingview.com/support/solutions/43000529348-how-to-configure-webhook-alerts/)
+  for a response. Queue publishing has a 0.5-second per-operation timeout and no
+  inline retries. Cold starts, DNS, and network delays still require deployment
+  measurement; this is not a guaranteed total response deadline.
+- QStash is configured for five retries and a 60-second delivery timeout. Monitor
+  its delivery logs and dead-letter queue, and replay exhausted jobs after fixing
+  the cause. Check your QStash plan supports these settings.
+- QStash deduplicates identical publish IDs for ten minutes. Redis suppresses
+  completed duplicates for seven days. Redis must retain data and avoid eviction
+  during this period. Reusing an `alert_id` with different data is a worker `409`
+  and requires fixing the sender.
+- A token-owned Redis lease prevents concurrent processing; Lua atomically stores
+  the result and releases the lock. Worker failures return `503`; a killed worker's
+  lease expires in 120 seconds so a later retry can recover.
+- This is at-least-once delivery, not exactly-once billing: a crash after a model
+  call but before storing its result can cause another paid call on retry. Alerts
+  older than 24 hours at processing time produce `Watch` without a model call.
+- SDK retries are disabled; QStash owns retries. Research requests have a 40-second
+  per-operation timeout and a 4,000-token output budget; Vercel imposes the
+  invocation's 60-second hard limit. Search adds variable latency and charges.
+  Measure live requests before relying on this budget; if searches repeatedly
+  time out, adjust the Vercel duration, QStash delivery timeout, Redis lock TTL,
+  and SDK timeout together to fit your plans. Failed or incomplete research is
+  retried, while completed research with inadequate evidence is stored as `Watch`.
+- Rate limiting can be configured in Vercel Firewall. Keep ingress and worker
+  secrets separate and monitor invocation counts and paid API usage.
+- Results are stored for polling; Telegram/email delivery is not implemented.
+
+## Local development and tests
+
+```bash
+uv sync --group dev
+# Export the variables from .env.example in your shell, then:
+uv run flask --app main run --port 3000
+uv run python -m pytest -q
+```
+
+Flask does not load `.env` automatically in this dependency set. Do not point a
+development worker at production Redis. End-to-end QStash testing requires a
+public HTTPS worker URL. Automated tests use fake Redis with actual Lua script
+execution and mocked queue/model calls; they do not contact paid services.

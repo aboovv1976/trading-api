@@ -1,0 +1,64 @@
+//@version=5
+indicator("Supertrend + ADX Alerts (Rich Data)", overlay=true)
+
+// Set a dedicated shared token in this private indicator's settings.
+webhookSecret = input.string("", "Webhook token")
+// Use a different identifier for each configured strategy/parameter set.
+strategyId = input.string("st-adx-v1", "Alert strategy ID")
+atrPeriod = input.int(10, "Supertrend ATR Period", minval=1)
+atrMult = input.float(3.0, "Supertrend Multiplier", minval=0.1, step=0.1)
+adxLen = input.int(14, "ADX Length", minval=1)
+adxThresh = input.float(25, "ADX Threshold", minval=0, maxval=100)
+
+[supertrend, direction] = ta.supertrend(atrMult, atrPeriod)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+highest20 = ta.highest(high, 20)
+lowest20 = ta.lowest(low, 20)
+avgVol20 = ta.sma(volume, 20)
+avgClose20 = ta.sma(close, 20)
+
+ready = not na(adx) and not na(supertrend) and not na(avgClose20) and not na(close[5])
+bullishFlip = barstate.isconfirmed and ready and direction < 0 and direction[1] >= 0 and adx > adxThresh
+bearishFlip = barstate.isconfirmed and ready and direction > 0 and direction[1] <= 0 and adx > adxThresh
+
+jsonString(string value) =>
+    escaped = str.replace_all(value, "\\", "\\\\")
+    escaped := str.replace_all(escaped, '"', '\\"')
+    escaped := str.replace_all(escaped, "\n", "\\n")
+    escaped := str.replace_all(escaped, "\r", "\\r")
+    escaped := str.replace_all(escaped, "\t", "\\t")
+    '"' + escaped + '"'
+
+jsonNumber(float value) =>
+    na(value) ? "null" : str.tostring(value, "#.################")
+
+message(string signal) =>
+    // alert() does not expand {{placeholders}}: construct every value directly.
+    eventId = strategyId + ":" + syminfo.tickerid + ":" + timeframe.period + ":" + str.tostring(time) + ":" + signal
+    body = '{"secret":' + jsonString(webhookSecret)
+    body += ',"alert_id":' + jsonString(eventId)
+    body += ',"ticker":' + jsonString(syminfo.tickerid)
+    body += ',"interval":' + jsonString(timeframe.period)
+    body += ',"signal":' + jsonString(signal)
+    body += ',"price":' + jsonNumber(close)
+    body += ',"open":' + jsonNumber(open)
+    body += ',"high":' + jsonNumber(high)
+    body += ',"low":' + jsonNumber(low)
+    body += ',"close":' + jsonNumber(close)
+    body += ',"volume":' + jsonNumber(volume)
+    body += ',"supertrend":' + jsonNumber(supertrend)
+    body += ',"adx":' + jsonNumber(adx)
+    body += ',"highest20":' + jsonNumber(highest20)
+    body += ',"lowest20":' + jsonNumber(lowest20)
+    body += ',"avgVol20":' + jsonNumber(avgVol20)
+    body += ',"avgClose20":' + jsonNumber(avgClose20)
+    body += ',"prevCloses":[' + jsonNumber(close[1]) + ',' + jsonNumber(close[2]) + ',' + jsonNumber(close[3]) + ',' + jsonNumber(close[4]) + ',' + jsonNumber(close[5]) + ']'
+    body += ',"time":' + jsonString(str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")) + '}'
+    body
+
+if str.length(webhookSecret) > 0 and (bullishFlip or bearishFlip)
+    alert(message(bullishFlip ? "green" : "red"), alert.freq_once_per_bar_close)
+
+plot(supertrend, "Supertrend", color=direction < 0 ? color.green : color.red, linewidth=2)
+plotshape(bullishFlip, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(bearishFlip, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
