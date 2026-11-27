@@ -254,6 +254,7 @@ def test_publish_transport_contract(payload, monkeypatch):
     assert request.headers["Upstash-Forward-Authorization"] == "Bearer worker-test"
     assert request.headers["Upstash-Deduplication-Id"] == main.fingerprint(alert)
     assert request.headers["Upstash-Retries"] == "5"
+    assert request.headers["Upstash-Timeout"] == f"{main.QSTASH_DELIVERY_TIMEOUT}s"
     assert "secret" not in json.loads(request.content)
     assert all(value == 0.5 for value in request.extensions["timeout"].values())
 
@@ -521,3 +522,36 @@ def test_specific_result_validation_and_missing_record(client):
 def test_old_result_routes_removed(client):
     assert client.get("/api/v1/results", headers=RESULT_AUTH).status_code == 404
     assert client.get("/api/v1/results/" + "a" * 64, headers=RESULT_AUTH).status_code == 404
+
+
+def test_research_timeouts_fit_deployment_and_lock_budget():
+    from pathlib import Path
+
+    config = json.loads((Path(main.__file__).parent / "vercel.json").read_text())
+    duration = config["functions"]["main.py"]["maxDuration"]
+    assert analysis.XAI_CONNECT_TIMEOUT_SECONDS + analysis.XAI_TIMEOUT_SECONDS + 20 < duration
+    assert duration < main.QSTASH_DELIVERY_TIMEOUT < main.LOCK_TTL
+
+
+def test_sdk_timeout_is_retryable_and_logged_without_credentials(client, payload, monkeypatch, caplog):
+    from openai import OpenAI
+
+    def handle(request):
+        raise httpx.ReadTimeout("sensitive response details", request=request)
+
+    def factory(**options):
+        assert options["timeout"].read == analysis.XAI_TIMEOUT_SECONDS
+        assert options["timeout"].connect == analysis.XAI_CONNECT_TIMEOUT_SECONDS
+        return OpenAI(**options, http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+
+    monkeypatch.setattr(analysis, "OpenAI", factory)
+    monkeypatch.setattr(main, "analyze", analysis.analyze)
+    response = client.post(WORKER, json=queued(payload), headers=AUTH)
+    assert response.status_code == 503
+    assert "APITimeoutError" in caplog.text
+    assert "stage=analysis" in caplog.text
+    assert "elapsed_seconds=" in caplog.text
+    assert "cause=ReadTimeout" in caplog.text
+    assert "sensitive response details" not in caplog.text + response.text
+    with main.redis_client() as store:
+        assert store.get("tv:{" + main.job_id_for(Alert.model_validate(queued(payload))) + "}:lock") is None

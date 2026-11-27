@@ -10,6 +10,8 @@ from openai import OpenAI
 from models import Recommendation
 
 DEFAULT_MODEL = "grok-4.7"
+XAI_TIMEOUT_SECONDS = 180
+XAI_CONNECT_TIMEOUT_SECONDS = 10
 LIMITATIONS = [
     "Web-sourced market data may be delayed or incomplete; no direct exchange feed is connected.",
     "Source content and timestamps are assessed by the model, not independently verified.",
@@ -77,7 +79,8 @@ def analyze(alert):
         return watch("Alert is older than 24 hours; a fresh alert is required.")
     with OpenAI(
         api_key=os.environ["XAI_API_KEY"], base_url="https://api.x.ai/v1",
-        timeout=httpx.Timeout(40, connect=3), max_retries=0,
+        timeout=httpx.Timeout(XAI_TIMEOUT_SECONDS, connect=XAI_CONNECT_TIMEOUT_SECONDS),
+        max_retries=0,
     ) as client:
         response = client.responses.create(
             model=os.environ.get("XAI_MODEL", DEFAULT_MODEL),

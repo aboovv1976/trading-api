@@ -37,8 +37,9 @@ Do not commit `.env` or actual credentials. `BACKGROUND_ANALYSIS` is no longer u
 
 Deploy this repository as a Flask project on Vercel. `pyproject.toml` explicitly
 identifies `main:app`; `.python-version` selects Python 3.12. `vercel.json` sets
-the function maximum duration to 60 seconds. Ensure your Vercel plan supports
-that duration. Use a stable production domain for `WORKER_URL`. TradingView
+the function maximum duration to 240 seconds. Enable Vercel Fluid compute (needed
+for this duration on Hobby), or use a plan that supports it. Use a stable
+production domain for `WORKER_URL`. TradingView
 must reach the webhook and QStash must reach the worker; configure Vercel
 Deployment Protection accordingly. Application authentication remains required.
 
@@ -212,7 +213,7 @@ environment variable or Redis migration is needed.
   for a response. Queue publishing has a 0.5-second per-operation timeout and no
   inline retries. Cold starts, DNS, and network delays still require deployment
   measurement; this is not a guaranteed total response deadline.
-- QStash is configured for five retries and a 60-second delivery timeout. Monitor
+- QStash is configured for five retries and a 270-second delivery timeout. Monitor
   its delivery logs and dead-letter queue, and replay exhausted jobs after fixing
   the cause. Check your QStash plan supports these settings.
 - QStash deduplicates identical publish IDs for ten minutes. Redis suppresses
@@ -221,17 +222,27 @@ environment variable or Redis migration is needed.
   and requires fixing the sender.
 - A token-owned Redis lease prevents concurrent processing; Lua atomically stores
   the result and releases the lock. Worker failures return `503`; a killed worker's
-  lease expires in 120 seconds so a later retry can recover.
+  lease expires in 300 seconds so a later retry can recover.
 - This is at-least-once delivery, not exactly-once billing: a crash after a model
   call but before storing its result can cause another paid call on retry. Alerts
   older than 24 hours at processing time produce `Watch` without a model call.
-- SDK retries are disabled; QStash owns retries. Research requests have a 40-second
-  per-operation timeout and a 4,000-token output budget; Vercel imposes the
-  invocation's 60-second hard limit. Search adds variable latency and charges.
+- SDK retries are disabled; QStash owns retries. Research requests have a 180-second
+  per-operation timeout (10 seconds for connection establishment) and a 4,000-token
+  output budget; Vercel imposes the invocation's 240-second hard limit. QStash's
+  270-second delivery timeout allows additional time for startup. Search adds
+  variable latency and charges.
   Measure live requests before relying on this budget; if searches repeatedly
   time out, adjust the Vercel duration, QStash delivery timeout, Redis lock TTL,
   and SDK timeout together to fit your plans. Failed or incomplete research is
   retried, while completed research with inadequate evidence is stored as `Watch`.
+- Worker failure logs include the processing stage, elapsed seconds, exception
+  class, and underlying cause class without logging provider bodies or secrets.
+  For example, `APITimeoutError` with `cause=ReadTimeout` indicates a stalled
+  response; `cause=ConnectTimeout` points to connection establishment. A timeout
+  alone does not establish whether xAI processing or the network caused the delay.
+- Timeout headers are stored on QStash messages at publication time. After
+  deploying timeout changes, publish a new test alert or replay old messages
+  with the updated delivery timeout; already queued messages retain the old one.
 - Rate limiting can be configured in Vercel Firewall. Keep ingress and worker
   secrets separate and monitor invocation counts and paid API usage.
 - Results are stored for polling; Telegram/email delivery is not implemented.

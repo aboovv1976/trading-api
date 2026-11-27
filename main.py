@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -18,7 +19,8 @@ from models import Alert
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
 RESULT_TTL = 7 * 24 * 60 * 60
-LOCK_TTL = 120  # Longer than the configured 60-second Vercel invocation.
+LOCK_TTL = 300  # Longer than the configured 240-second Vercel invocation.
+QSTASH_DELIVERY_TIMEOUT = 270  # Allows for invocation startup and shutdown.
 RESULTS_PATH = "/api/v1/results-8dc2a850b73dc31d"
 
 # A timed-out worker cannot release another delivery's lock or overwrite its result.
@@ -94,7 +96,7 @@ def publish(alert, job_id):
                 "Upstash-Forward-Authorization": "Bearer " + os.environ["WORKER_TOKEN"],
                 "Upstash-Deduplication-Id": fingerprint(alert),
                 "Upstash-Retries": "5",
-                "Upstash-Timeout": "60s",
+                "Upstash-Timeout": f"{QSTASH_DELIVERY_TIMEOUT}s",
             },
             json=alert.model_dump(mode="json"),
         )
@@ -145,6 +147,8 @@ def analysis_worker():
     owner = uuid4().hex
     store = None
     acquired = False
+    started = time.monotonic()
+    stage = "redis_lookup"
     try:
         store = redis_client()
         existing = store.get(result_key)
@@ -152,6 +156,7 @@ def analysis_worker():
             if json.loads(existing)["fingerprint"] != fingerprint(alert):
                 return jsonify(error="alert_id already used for different data"), 409
             return jsonify(status="completed", job_id=job_id, duplicate=True), 200
+        stage = "redis_lock"
         acquired = bool(store.set(lock_key, owner, nx=True, ex=LOCK_TTL))
         if not acquired:
             return jsonify(error="Analysis in progress"), 503
@@ -161,19 +166,25 @@ def analysis_worker():
             if json.loads(existing)["fingerprint"] != fingerprint(alert):
                 return jsonify(error="alert_id already used for different data"), 409
             return jsonify(status="completed", job_id=job_id, duplicate=True), 200
+        stage = "analysis"
         result = {
             "job_id": job_id, "fingerprint": fingerprint(alert),
             "alert": alert.model_dump(mode="json"),
             "analysis": analyze(alert).model_dump(mode="json"),
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
+        stage = "redis_commit"
         if not store.eval(COMPLETE, 2, lock_key, result_key, owner, json.dumps(result), RESULT_TTL):
             raise RuntimeError("Worker lease expired")
         acquired = False
         app.logger.info("Analysis stored job_id=%s", job_id)
         return jsonify(status="completed", job_id=job_id), 200
     except Exception as exc:
-        app.logger.error("Analysis failed job_id=%s (%s)", job_id, type(exc).__name__)
+        app.logger.error(
+            "Analysis failed job_id=%s (%s) stage=%s elapsed_seconds=%.3f cause=%s",
+            job_id, type(exc).__name__, stage, time.monotonic() - started,
+            type(exc.__cause__).__name__ if exc.__cause__ else "none",
+        )
         return jsonify(error="Analysis temporarily unavailable"), 503
     finally:
         if acquired and store is not None:
