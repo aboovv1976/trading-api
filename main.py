@@ -9,19 +9,28 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import httpx
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, render_template, request
 from pydantic import ValidationError
 from redis import Redis
 
 from analysis import analyze
 from models import Alert
+from reports import REPORTS_PATH, valid_job_id, valid_report_signature, with_report
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
 RESULT_TTL = 7 * 24 * 60 * 60
-LOCK_TTL = 300  # Longer than the configured 240-second Vercel invocation.
-QSTASH_DELIVERY_TIMEOUT = 270  # Allows for invocation startup and shutdown.
+LOCK_TTL = 360  # Longer than the configured 300-second Vercel invocation.
+QSTASH_DELIVERY_TIMEOUT = 330  # Allows for invocation startup and shutdown.
 RESULTS_PATH = "/api/v1/results-8dc2a850b73dc31d"
+# These fields were added after the original alert identity format. Omitting
+# absent context preserves IDs/fingerprints for pre-upgrade queued alerts.
+ADDITIONAL_CONTEXT_FIELDS = frozenset({
+    "strategy_id", "script_version", "currency", "instrument_type", "exchange_timezone",
+    "chart_session", "session_state", "is_standard_chart", "bar_confirmed",
+    "bar_open_time", "bar_close_time", "atr", "atr_pct", "di_plus", "di_minus",
+    "indicator_settings",
+})
 
 # A timed-out worker cannot release another delivery's lock or overwrite its result.
 RELEASE = """
@@ -66,7 +75,11 @@ def redis_client():
 
 
 def canonical(alert):
-    return json.dumps(alert.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    data = alert.model_dump(mode="json")
+    for field in ADDITIONAL_CONTEXT_FIELDS:
+        if data[field] is None:
+            del data[field]
+    return json.dumps(data, sort_keys=True, separators=(",", ":"))
 
 
 def fingerprint(alert):
@@ -226,7 +239,7 @@ def list_results():
                         pipeline.get(key)
                     values = pipeline.execute()
         # A result can expire between SCAN and GET. Skip it without failing a page.
-        results = [json.loads(value) for value in values if value is not None]
+        results = [with_report(json.loads(value)) for value in values if value is not None]
         return jsonify(results=results, next_cursor=str(next_cursor)), 200
     except Exception as exc:
         app.logger.error("Result listing failed (%s)", type(exc).__name__)
@@ -239,26 +252,96 @@ def get_result(job_id):
         return jsonify(error="Server misconfigured"), 503
     if not bearer_authorized("RESULT_API_TOKEN"):
         return jsonify(error="Unauthorized"), 401
-    if len(job_id) != 64 or any(c not in "0123456789abcdef" for c in job_id):
+    if not valid_job_id(job_id):
         return jsonify(error="Invalid job ID"), 400
+    output_format = request.args.get("format", "json")
+    if output_format not in ("json", "text"):
+        return jsonify(error="format must be json or text"), 400
     try:
         with redis_client() as store:
             result = store.get("tv:{" + job_id + "}:result")
         if result is None:
             return jsonify(error="Result not available"), 404
-        return jsonify(json.loads(result)), 200
+        record = with_report(json.loads(result))
+        if output_format == "text":
+            if not record["recommendation_text"]:
+                return jsonify(error="Readable report not available; use the JSON result"), 409
+            return Response(record["recommendation_text"], mimetype="text/plain")
+        return jsonify(record), 200
     except Exception as exc:
         app.logger.error("Result lookup failed (%s)", type(exc).__name__)
         return jsonify(error="Storage unavailable"), 503
 
 
+@app.post(REPORTS_PATH + "/<job_id>/link")
+def create_report_link(job_id):
+    if not configured("RESULT_API_TOKEN", "REDIS_URL", "WORKER_URL"):
+        return jsonify(error="Server misconfigured"), 503
+    if not bearer_authorized("RESULT_API_TOKEN"):
+        return jsonify(error="Unauthorized"), 401
+    if not valid_job_id(job_id):
+        return jsonify(error="Invalid job ID"), 400
+    try:
+        with redis_client() as store:
+            value = store.get("tv:{" + job_id + "}:result")
+        if value is None:
+            return jsonify(error="Result not available"), 404
+        record = with_report(json.loads(value))
+        if not record["report_url"]:
+            return jsonify(error="Readable report not available for this result"), 409
+        return jsonify({key: record[key] for key in (
+            "job_id", "report_url", "report_expires_at", "notification_text", "notification_message",
+        )}), 200
+    except Exception as exc:
+        app.logger.error("Report link generation failed (%s)", type(exc).__name__)
+        return jsonify(error="Report temporarily unavailable"), 503
+
+
+@app.get(REPORTS_PATH + "/<job_id>")
+def view_report(job_id):
+    if not configured("RESULT_API_TOKEN", "REDIS_URL"):
+        return jsonify(error="Server misconfigured"), 503
+    if not valid_report_signature(job_id, request.args.get("expires"), request.args.get("signature")):
+        return jsonify(error="Invalid or expired report link"), 403
+    try:
+        with redis_client() as store:
+            value = store.get("tv:{" + job_id + "}:result")
+        if value is None:
+            return jsonify(error="Report not available"), 404
+        record = json.loads(value)
+        if not (record.get("analysis") or {}).get("recommendation_text"):
+            return jsonify(error="Readable report not available for this result"), 409
+        response = Response(render_template(
+            "report.html", record=record,
+            alert_json=json.dumps(record.get("alert", {}), indent=2, ensure_ascii=False),
+            analysis_json=json.dumps(record["analysis"], indent=2, ensure_ascii=False),
+        ), mimetype="text/html")
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+            "frame-ancestors 'none'; form-action 'none'"
+        )
+        return response
+    except Exception as exc:
+        app.logger.error("Report rendering failed (%s)", type(exc).__name__)
+        return jsonify(error="Report temporarily unavailable"), 503
+
+
 @app.after_request
 def prevent_caching(response):
     response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    if request.endpoint != "home":
+        response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
     return response
 
 
 @app.get("/")
+def home():
+    return render_template("home.html", year=datetime.now(timezone.utc).year)
+
+
+@app.get("/health")
 def health():
     # Liveness only; this does not claim external services are healthy.
     return jsonify(status="ok"), 200

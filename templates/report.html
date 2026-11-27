@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <title>{{ record.alert.ticker }} — {{ record.analysis.decision }} | Trading report</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, sans-serif; color: #18283c; background: #f2f5f9; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 40px 20px; }
+    main { max-width: 860px; margin: auto; }
+    .eyebrow { color: #53677f; font-size: .8rem; text-transform: uppercase; letter-spacing: .12em; font-weight: 700; }
+    h1 { font-size: clamp(1.8rem, 5vw, 2.8rem); margin: 12px 0; overflow-wrap: anywhere; }
+    .decision { display: inline-block; border: 1px solid #bcc9d8; border-radius: 20px; padding: 6px 14px; font-weight: 700; background: #fff; }
+    .meta, footer { color: #53677f; font-size: .9rem; line-height: 1.7; overflow-wrap: anywhere; }
+    article, details { background: white; border: 1px solid #dce3ec; border-radius: 14px; padding: 24px; margin-top: 20px; }
+    .report { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.75; margin: 0; }
+    summary { font-weight: 650; cursor: pointer; }
+    .json { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; line-height: 1.5; }
+    footer { padding: 20px 0; }
+    @media (max-width: 500px) { body { padding: 24px 12px; } article, details { padding: 18px; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Trading alert report</div>
+  <h1>{{ record.alert.ticker }}</h1>
+  <span class="decision">{{ record.analysis.decision }}</span>
+  <p class="meta">Completed: {{ record.completed_at }}<br>Job: {{ record.job_id }}</p>
+  <article aria-label="Recommendation"><pre class="report">{{ record.analysis.recommendation_text }}</pre></article>
+  <details><summary>Original validated alert</summary><pre class="json">{{ alert_json }}</pre></details>
+  <details><summary>Structured analysis</summary><pre class="json">{{ analysis_json }}</pre></details>
+  {% if record.analysis.sources %}
+  <details><summary>Source links</summary><ul>
+    {% for source in record.analysis.sources %}
+    {% if source.url.startswith('https://') or source.url.startswith('http://') %}
+    <li><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{{ source.title }}</a>
+      <span class="meta"> — {{ source.as_of or 'Observation time unavailable' }}</span></li>
+    {% endif %}
+    {% endfor %}
+  </ul></details>
+  {% endif %}
+  <footer>This is a model-generated research report. Source accuracy and timestamps have not been independently verified.
+    Anyone with this signed link can read this report until the link or stored result expires.</footer>
+</main>
+</body>
+</html>

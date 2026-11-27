@@ -27,6 +27,18 @@ def reject_boolean(value):
     return value
 
 
+class IndicatorSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    atr_period: Annotated[int, Field(strict=True, ge=1)]
+    atr_multiplier: Price
+    adx_length: Annotated[int, Field(strict=True, ge=1)]
+    adx_smoothing: Annotated[int, Field(strict=True, ge=1)]
+    adx_threshold: Annotated[float, Field(ge=0, le=100, allow_inf_nan=False)]
+
+    _numeric = field_validator("atr_multiplier", "adx_threshold", mode="before")(reject_boolean)
+
+
 class Alert(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -36,6 +48,22 @@ class Alert(BaseModel):
     price: Price
     interval: Annotated[str, Field(min_length=1, max_length=10, pattern=r"^[0-9A-Za-z]+$")]
     time: datetime
+    strategy_id: Optional[Annotated[str, Field(min_length=1, max_length=128)]] = None
+    script_version: Optional[Annotated[str, Field(min_length=1, max_length=32)]] = None
+    currency: Optional[Annotated[str, Field(min_length=1, max_length=32)]] = None
+    instrument_type: Optional[Annotated[str, Field(min_length=1, max_length=32)]] = None
+    exchange_timezone: Optional[Annotated[str, Field(min_length=1, max_length=100)]] = None
+    chart_session: Optional[Annotated[str, Field(min_length=1, max_length=64)]] = None
+    session_state: Optional[Literal["regular", "premarket", "postmarket", "other", "not_applicable"]] = None
+    is_standard_chart: Optional[Annotated[bool, Field(strict=True)]] = None
+    bar_confirmed: Optional[Annotated[bool, Field(strict=True)]] = None
+    bar_open_time: Optional[datetime] = None
+    bar_close_time: Optional[datetime] = None
+    atr: Optional[NonNegative] = None
+    atr_pct: Optional[NonNegative] = None
+    di_plus: Optional[NonNegative] = None
+    di_minus: Optional[NonNegative] = None
+    indicator_settings: Optional[IndicatorSettings] = None
     open: Optional[Price] = None
     high: Optional[Price] = None
     low: Optional[Price] = None
@@ -58,9 +86,16 @@ class Alert(BaseModel):
 
     _iso_time = field_validator("time", mode="before")(iso_timestamp)
     _utc_time = field_validator("time")(timezone_required)
+    _iso_bar_times = field_validator("bar_open_time", "bar_close_time", mode="before")(
+        lambda value: iso_timestamp(value) if value is not None else None
+    )
+    _utc_bar_times = field_validator("bar_open_time", "bar_close_time")(
+        lambda value: timezone_required(value) if value is not None else None
+    )
     _numeric = field_validator(
         "price", "open", "high", "low", "close", "volume", "supertrend", "adx",
-        "highest20", "lowest20", "avgVol20", "avgClose20", mode="before",
+        "highest20", "lowest20", "avgVol20", "avgClose20", "atr", "atr_pct",
+        "di_plus", "di_minus", mode="before",
     )(reject_boolean)
 
     @field_validator("prevCloses", mode="before")
@@ -73,6 +108,13 @@ class Alert(BaseModel):
 
     @model_validator(mode="after")
     def consistent_prices(self):
+        if self.bar_open_time is not None and self.bar_close_time is not None:
+            if self.bar_open_time >= self.bar_close_time:
+                raise ValueError("Bar opening time must precede closing time")
+        if self.bar_open_time is not None and self.bar_open_time > self.time:
+            raise ValueError("Bar cannot open after the alert timestamp")
+        if self.bar_confirmed is True and self.bar_close_time is not None and self.bar_close_time > self.time:
+            raise ValueError("Confirmed bar cannot close after the alert timestamp")
         if self.close is not None and self.close != self.price:
             raise ValueError("price and close must match when both are supplied")
         if self.high is not None and self.low is not None and self.high < self.low:
@@ -111,6 +153,8 @@ class Recommendation(BaseModel):
     limitations: Annotated[list[Annotated[str, Field(max_length=500)]], Field(max_length=20)]
     market_data_sufficient: bool
     sources: Annotated[list[Source], Field(max_length=20)]
+    recommendation_text: Annotated[str, Field(min_length=1, max_length=12000)]
+    notification_text: Annotated[str, Field(min_length=1, max_length=300)]
 
     @model_validator(mode="after")
     def valid_levels(self):

@@ -113,6 +113,7 @@ def test_missing_config_does_not_break_health(client, monkeypatch):
     monkeypatch.delenv("XAI_API_KEY")
     monkeypatch.delenv("TV_WEBHOOK_SECRET")
     assert client.get("/").status_code == 200
+    assert client.get("/health").json == {"status": "ok"}
     assert client.post(WEBHOOK, json={}).status_code == 503
     assert client.post(WORKER, json={}, headers=AUTH).status_code == 503
 
@@ -313,6 +314,8 @@ def sourced_buy(payload):
     response = model_response(
         payload, decision="Buy", buy_price=200, stop_loss=190, sell_target=220,
         time_limit="5 trading days", market_data_sufficient=True,
+        recommendation_text="RECOMMENDATION\nBuy. Entry 200, stop 190, target 220; 5 trading days.",
+        notification_text="NASDAQ:AAPL — Buy. Daily test; see the full report for evidence and risks.",
         sources=[{"url": "https://example.com/history", "title": "Market history",
                   "kind": "market_data", "as_of": payload["time"]}],
     )
@@ -457,6 +460,7 @@ def test_listing_traverses_all_completed_results(client):
         assert response.status_code == 200
         assert response.headers["Cache-Control"] == "no-store"
         assert all(record["analysis"]["decision"] == "Watch" for record in response.json["results"])
+        assert all("recommendation_text" in record for record in response.json["results"])
         found.update(record["job_id"] for record in response.json["results"])
         cursor = response.json["next_cursor"]
         assert isinstance(cursor, str)
@@ -555,3 +559,138 @@ def test_sdk_timeout_is_retryable_and_logged_without_credentials(client, payload
     assert "sensitive response details" not in caplog.text + response.text
     with main.redis_client() as store:
         assert store.get("tv:{" + main.job_id_for(Alert.model_validate(queued(payload))) + "}:lock") is None
+
+
+@pytest.fixture
+def enriched_payload(rich_payload):
+    end = datetime.fromisoformat(rich_payload["time"]) - timedelta(seconds=1)
+    rich_payload.update({
+        "strategy_id": "st-adx-v1", "script_version": "2.0.0", "currency": "USD",
+        "instrument_type": "stock", "exchange_timezone": "America/New_York",
+        "chart_session": "regular", "session_state": "regular",
+        "is_standard_chart": True, "bar_confirmed": True,
+        "bar_open_time": (end - timedelta(minutes=5)).isoformat(),
+        "bar_close_time": end.isoformat(), "atr": 2.5,
+        "atr_pct": 2.5 / 200.5 * 100, "di_plus": 30, "di_minus": 15,
+        "indicator_settings": {
+            "atr_period": 10, "atr_multiplier": 3.0, "adx_length": 14,
+            "adx_smoothing": 14, "adx_threshold": 25,
+        },
+    })
+    return rich_payload
+
+
+def test_enriched_alert_accepted_and_sent_to_grok(client, enriched_payload, monkeypatch):
+    assert client.post(WEBHOOK, json=enriched_payload).status_code == 202
+    alert = main.publish.call_args.args[0]
+    sdk, _ = install_model(monkeypatch, model_response(enriched_payload))
+    analysis.analyze(alert)
+    data = json.loads(sdk.responses.create.call_args.kwargs["input"])["alert"]
+    assert data["currency"] == "USD"
+    assert data["is_standard_chart"] is True
+    assert data["bar_confirmed"] is True
+    assert data["atr"] == 2.5
+    assert data["di_minus"] == 15
+    assert data["indicator_settings"]["adx_smoothing"] == 14
+    assert datetime.fromisoformat(data["bar_close_time"]) == alert.bar_close_time
+    assert "secret" not in data
+
+
+@pytest.mark.parametrize("changes", [
+    {"atr": -1}, {"atr_pct": "Infinity"}, {"di_plus": True}, {"di_minus": -1},
+    {"is_standard_chart": "true"}, {"bar_confirmed": 1},
+    {"session_state": "unknown"}, {"currency": ""},
+    {"bar_open_time": "2026-11-27T10:00:00"},
+    {"bar_close_time": 123}, {"indicator_settings": {"atr_period": 10}},
+])
+def test_enriched_fields_are_validated(client, enriched_payload, changes):
+    enriched_payload.update(changes)
+    assert client.post(WEBHOOK, json=enriched_payload).status_code == 400
+
+
+def test_bar_timestamps_must_be_consistent(client, enriched_payload):
+    enriched_payload["bar_close_time"] = enriched_payload["bar_open_time"]
+    assert client.post(WEBHOOK, json=enriched_payload).status_code == 400
+    enriched_payload["bar_close_time"] = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    assert client.post(WEBHOOK, json=enriched_payload).status_code == 400
+
+
+@pytest.mark.parametrize("changes", [
+    {"atr_period": True}, {"atr_period": 0}, {"atr_multiplier": -1},
+    {"adx_threshold": 101}, {"adx_smoothing": 0},
+])
+def test_indicator_parameters_are_validated(client, enriched_payload, changes):
+    enriched_payload["indicator_settings"].update(changes)
+    assert client.post(WEBHOOK, json=enriched_payload).status_code == 400
+
+
+def test_result_has_structured_and_readable_views(client, enriched_payload, monkeypatch):
+    run = MagicMock(return_value=analysis.watch("No reliable intraday history found."))
+    monkeypatch.setattr(main, "analyze", run)
+    processed = client.post(WORKER, json=queued(enriched_payload), headers=AUTH)
+    assert processed.status_code == 200
+    path = main.RESULTS_PATH + "/" + processed.json["job_id"]
+    response = client.get(path, headers=RESULT_AUTH)
+    assert response.status_code == 200
+    assert response.json["analysis"]["decision"] == "Watch"
+    assert response.json["recommendation_text"].startswith("WATCH")
+    assert "No reliable intraday history found." in response.json["recommendation_text"]
+    plain = client.get(path + "?format=text", headers=RESULT_AUTH)
+    assert plain.status_code == 200
+    assert plain.mimetype == "text/plain"
+    assert plain.headers["Cache-Control"] == "no-store"
+    assert plain.text == response.json["recommendation_text"]
+    assert client.get(path + "?format=text").status_code == 401
+    assert client.get(path + "?format=html", headers=RESULT_AUTH).status_code == 400
+    run.assert_called_once()
+
+
+def test_old_results_remain_json_without_recreating_reports(client):
+    job_id = "b" * 64
+    key = "tv:{" + job_id + "}:result"
+    original = json.dumps({"job_id": job_id, "alert": {"ticker": "NASDAQ:AAPL", "signal": "green"},
+                           "analysis": {"decision": "Watch", "rationale": "Legacy analysis"}})
+    with main.redis_client() as store:
+        store.set(key, original, ex=100)
+    response = client.get(main.RESULTS_PATH + "/" + job_id, headers=RESULT_AUTH)
+    assert response.status_code == 200
+    assert response.json["recommendation_text"] is None
+    assert response.json["analysis"]["rationale"] == "Legacy analysis"
+    assert client.get(main.RESULTS_PATH + "/" + job_id + "?format=text", headers=RESULT_AUTH).status_code == 409
+    with main.redis_client() as store:
+        assert store.get(key) == original
+
+
+@pytest.mark.parametrize("explicit_id, expected", [
+    (False, "e6b83bba82a94e808e4a2fccef4ed49db6bfd2fe9044bcc1169d10981cf77c4a"),
+    (True, "f19fd8d455ab9d44628fbcae7774b0000637db5e0b9613daf13a5a035ad46687"),
+])
+def test_pre_upgrade_alert_identity_is_preserved(explicit_id, expected):
+    # Fixed reference fingerprints from the deployed pre-context schema.
+    data = {"ticker": "NASDAQ:AAPL", "signal": "green", "price": 200.5,
+            "interval": "5", "time": "2026-11-27T15:00:00Z"}
+    if explicit_id:
+        data["alert_id"] = "compatibility-check"
+    alert = Alert.model_validate(data)
+    assert main.fingerprint(alert) == expected
+    if not explicit_id:
+        assert main.job_id_for(alert) == expected
+    data.update(currency=None, atr=None)
+    assert main.fingerprint(Alert.model_validate(data)) == expected
+    data["currency"] = "USD"
+    assert main.fingerprint(Alert.model_validate(data)) != expected
+
+
+def test_pre_upgrade_completed_job_is_not_reanalyzed(client):
+    data = {"alert_id": "compatibility-check", "ticker": "NASDAQ:AAPL", "signal": "green",
+            "price": 200.5, "interval": "5", "time": "2026-11-27T15:00:00Z"}
+    job_id = main.job_id_for(Alert.model_validate(data))
+    with main.redis_client() as store:
+        store.set("tv:{" + job_id + "}:result", json.dumps({
+            "fingerprint": "f19fd8d455ab9d44628fbcae7774b0000637db5e0b9613daf13a5a035ad46687",
+            "alert": data, "analysis": {"decision": "Watch"},
+        }))
+    response = client.post(WORKER, json=data, headers=AUTH)
+    assert response.status_code == 200
+    assert response.json["duplicate"] is True
+    main.analyze.assert_not_called()

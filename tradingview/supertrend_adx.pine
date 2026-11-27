@@ -1,5 +1,6 @@
-//@version=5
+//@version=6
 indicator("Supertrend + ADX Alerts (Rich Data)", overlay=true)
+const string SCRIPT_VERSION = "2.0.0"
 
 // Set a dedicated shared token in this private indicator's settings.
 webhookSecret = input.string("", "Webhook token")
@@ -12,6 +13,8 @@ adxThresh = input.float(25, "ADX Threshold", minval=0, maxval=100)
 
 [supertrend, direction] = ta.supertrend(atrMult, atrPeriod)
 [diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+atrValue = ta.atr(atrPeriod)
+atrPercent = close > 0 ? atrValue / close * 100 : na
 highest20 = ta.highest(high, 20)
 lowest20 = ta.lowest(low, 20)
 avgVol20 = ta.sma(volume, 20)
@@ -32,6 +35,9 @@ jsonString(string value) =>
 jsonNumber(float value) =>
     na(value) ? "null" : str.tostring(value, "#.################")
 
+jsonTimestamp(int value) =>
+    na(value) ? "null" : jsonString(str.format_time(value, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC"))
+
 message(string signal) =>
     // alert() does not expand {{placeholders}}: construct every value directly.
     eventId = strategyId + ":" + syminfo.tickerid + ":" + timeframe.period + ":" + str.tostring(time) + ":" + signal
@@ -40,6 +46,19 @@ message(string signal) =>
     body += ',"ticker":' + jsonString(syminfo.tickerid)
     body += ',"interval":' + jsonString(timeframe.period)
     body += ',"signal":' + jsonString(signal)
+    body += ',"strategy_id":' + jsonString(strategyId)
+    body += ',"script_version":' + jsonString(SCRIPT_VERSION)
+    body += ',"currency":' + jsonString(syminfo.currency)
+    body += ',"instrument_type":' + jsonString(syminfo.type)
+    body += ',"exchange_timezone":' + jsonString(syminfo.timezone)
+    body += ',"chart_session":' + jsonString(syminfo.session)
+    // Session-state flags are meaningful for intraday bars.
+    sessionState = not timeframe.isintraday ? "not_applicable" : session.ismarket ? "regular" : session.ispremarket ? "premarket" : session.ispostmarket ? "postmarket" : "other"
+    body += ',"session_state":' + jsonString(sessionState)
+    body += ',"is_standard_chart":' + (chart.is_standard ? "true" : "false")
+    body += ',"bar_confirmed":' + (barstate.isconfirmed ? "true" : "false")
+    body += ',"bar_open_time":' + jsonTimestamp(time)
+    body += ',"bar_close_time":' + jsonTimestamp(time_close)
     body += ',"price":' + jsonNumber(close)
     body += ',"open":' + jsonNumber(open)
     body += ',"high":' + jsonNumber(high)
@@ -48,12 +67,21 @@ message(string signal) =>
     body += ',"volume":' + jsonNumber(volume)
     body += ',"supertrend":' + jsonNumber(supertrend)
     body += ',"adx":' + jsonNumber(adx)
+    body += ',"di_plus":' + jsonNumber(diPlus)
+    body += ',"di_minus":' + jsonNumber(diMinus)
+    body += ',"atr":' + jsonNumber(atrValue)
+    body += ',"atr_pct":' + jsonNumber(atrPercent)
+    body += ',"indicator_settings":{"atr_period":' + str.tostring(atrPeriod)
+    body += ',"atr_multiplier":' + jsonNumber(atrMult)
+    body += ',"adx_length":' + str.tostring(adxLen)
+    body += ',"adx_smoothing":' + str.tostring(adxLen)
+    body += ',"adx_threshold":' + jsonNumber(adxThresh) + '}'
     body += ',"highest20":' + jsonNumber(highest20)
     body += ',"lowest20":' + jsonNumber(lowest20)
     body += ',"avgVol20":' + jsonNumber(avgVol20)
     body += ',"avgClose20":' + jsonNumber(avgClose20)
     body += ',"prevCloses":[' + jsonNumber(close[1]) + ',' + jsonNumber(close[2]) + ',' + jsonNumber(close[3]) + ',' + jsonNumber(close[4]) + ',' + jsonNumber(close[5]) + ']'
-    body += ',"time":' + jsonString(str.format_time(timenow, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")) + '}'
+    body += ',"time":' + jsonTimestamp(timenow) + '}'
     body
 
 if str.length(webhookSecret) > 0 and (bullishFlip or bearishFlip)

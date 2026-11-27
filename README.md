@@ -37,8 +37,8 @@ Do not commit `.env` or actual credentials. `BACKGROUND_ANALYSIS` is no longer u
 
 Deploy this repository as a Flask project on Vercel. `pyproject.toml` explicitly
 identifies `main:app`; `.python-version` selects Python 3.12. `vercel.json` sets
-the function maximum duration to 240 seconds. Enable Vercel Fluid compute (needed
-for this duration on Hobby), or use a plan that supports it. Use a stable
+the function maximum duration to 300 seconds, the Hobby/free-tier maximum with
+Fluid compute enabled. Ensure Fluid compute is enabled for your project. Use a stable
 production domain for `WORKER_URL`. TradingView
 must reach the webhook and QStash must reach the worker; configure Vercel
 Deployment Protection accordingly. Application authentication remains required.
@@ -83,7 +83,7 @@ more than five minutes in the future.
 ### Supertrend + ADX indicator
 
 Use [tradingview/supertrend_adx.pine](tradingview/supertrend_adx.pine) for the
-rich alert format. Paste the file into TradingView's Pine Editor, save it, and
+rich alert format (Pine Script v6). Paste the file into TradingView's Pine Editor, save it, and
 add it to the desired standard OHLC chart. In the indicator settings, set the
 webhook token to the same value as Vercel's `TV_WEBHOOK_SECRET`. Use a different
 strategy ID for each parameter set. Keep generated alert IDs within 128 characters.
@@ -97,7 +97,7 @@ requires recreating the TradingView alert, which uses a saved snapshot.
 
 The script uses `alert()` because `alertcondition()` requires a constant message
 and cannot concatenate runtime `str.tostring()` values. See
-[TradingView's alert documentation](https://www.tradingview.com/pine-script-docs/v5/concepts/alerts/).
+[TradingView's alert documentation](https://www.tradingview.com/pine-script-docs/concepts/alerts/).
 It sends the signal bar's OHLCV, Supertrend, ADX, 20-bar high/low and averages,
 plus five previous closes (newest first). Missing numeric values become JSON
 `null`; alerts wait for indicator warmup. No candle array is sent. The script
@@ -109,6 +109,35 @@ The API accepts these optional fields: `open`, `high`, `low`, `close`, `volume`,
 must match. ADX must be in [0, 100], volume must be nonnegative, supplied OHLC
 values must have consistent ranges, and `prevCloses` must have five entries.
 Grok receives these values as sender-supplied context and still performs Web Search.
+
+Pine script version `2.0.0` also sends the following optional context:
+
+| Fields | Meaning |
+| --- | --- |
+| `bar_open_time`, `bar_close_time`, `bar_confirmed` | Exact signal-bar boundaries in UTC and confirmation state; `time` remains alert-generation time |
+| `currency`, `instrument_type`, `exchange_timezone` | Quote currency, asset type and exchange timezone |
+| `chart_session`, `session_state` | Dataset session setting and intraday state (`regular`, `premarket`, `postmarket`, `other`); non-intraday state is `not_applicable` |
+| `is_standard_chart` | False for nonstandard charts whose OHLC values may be synthetic |
+| `atr`, `atr_pct` | ATR using the Supertrend ATR period, and `100 * ATR / close` (percentage points) |
+| `di_plus`, `di_minus` | Directional indicators from the same DMI calculation as ADX |
+| `strategy_id`, `script_version` | Strategy-instance label and payload-producing script version |
+| `indicator_settings` | `atr_period`, `atr_multiplier`, `adx_length`, `adx_smoothing`, `adx_threshold`; DMI length and ADX smoothing both use the current ADX Length input |
+
+These are summaries and metadata, not candle arrays or independently verified
+data. ATR values can be zero; unavailable numeric values remain null. Session
+labels follow TradingView's feed/exchange definitions. Bar timestamps must carry
+a timezone, opening must precede closing, and a confirmed close cannot be later
+than alert generation. Grok is instructed to disclose synthetic chart prices and
+unconfirmed signals. New fields do not change the existing flip/ADX trigger rules.
+
+**Deploy the updated API before installing this script version**; older API
+deployments reject unknown fields. Then manually paste the updated Pine script,
+save/update it on the chart, set its webhook token, and recreate the TradingView
+alert so its saved snapshot includes the new payload. Existing smaller alert
+payloads remain supported by the updated API.
+Absent fields from this context expansion are omitted from canonical job
+identities so pre-upgrade queued alerts and completed-result fingerprints remain
+compatible. Supplied context values still contribute to the fingerprint.
 
 Pine compilation and actual alert delivery must be verified in TradingView;
 the local test suite verifies the corresponding API payload and analysis input.
@@ -174,11 +203,89 @@ curl --fail-with-body \
 
 Results contain the normalized alert, completion timestamp, and structured
 analysis: `decision`, `buy_price`, `stop_loss`, `sell_target`, `time_limit`,
-`rationale`, `limitations`, `market_data_sufficient`, and `sources`. A `Buy` response requires positive price levels
+`rationale`, `limitations`, `market_data_sufficient`, `sources`, `recommendation_text`,
+and `notification_text`. A `Buy` response requires positive price levels
 with `stop_loss < buy_price < sell_target`. Invalid or incomplete model responses
 fail the worker and are retried. Results expire after seven days. `404` means
 not available: queued, failed, unknown, and expired jobs are not distinguished.
-`GET /` reports application liveness only, not downstream service health.
+`GET /` serves the public Trade-notify company landing page. `GET /health`
+reports application liveness only, not downstream service health. Neither route
+requires credentials or makes a Redis/xAI request. The landing page's sample
+alert is illustrative and does not expose stored results or API credentials.
+
+### Readable recommendation
+
+Grok generates both `recommendation_text` (a full plain-text report) and
+`notification_text` (a plain-text summary of up to 300 characters) in the original
+analysis request alongside the structured fields. The prompt requires TRIGGER,
+INPUTS, RECOMMENDATION, RISKS AND LIMITATIONS, and SOURCES sections, matching the
+structured decision and price levels. The report must distinguish sender claims
+from independently retrieved evidence and identify missing or conflicting inputs.
+The application validates the schema but cannot guarantee the model's prose is
+factually or semantically consistent; review reports before relying on them.
+
+The separate narrative formatter has been removed. Application-level stale-alert
+or evidence-check failures produce a short Watch notice rather than exposing a
+potentially contradictory model-written recommendation. These notices are not
+full research reports. The structured limitations and sources remain alongside.
+
+Single-result JSON and each list entry include `recommendation_text`,
+`notification_text`, `report_url`, `report_expires_at`, and `notification_message`,
+alongside the original `alert` and `analysis`. Text fields are also stored inside
+`analysis`. `notification_message` appends the signed report URL to the model's
+short summary, ready for a delivery integration. It may span multiple SMS segments.
+
+For a human-readable plain-text response:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $RESULT_API_TOKEN" \
+  "https://YOUR_DOMAIN/api/v1/results-8dc2a850b73dc31d/JOB_ID?format=text"
+```
+
+The default is `format=json`; other formats return `400`. Authentication is
+required for both formats. Text output returns Grok's stored report directly.
+Older records without model-written report fields remain available as JSON with
+null report/text metadata; `format=text` and link creation return `409`. Nothing
+rewrites these records or reruns Grok just to create a report.
+
+### Share a browser report
+
+Generate a signed link for a completed result with model-written report text:
+
+```bash
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer $RESULT_API_TOKEN" \
+  "https://YOUR_DOMAIN/api/v1/reports-da0db27189a6e42d/JOB_ID/link"
+```
+
+The response contains `job_id`, `report_url`, `report_expires_at`,
+`notification_text`, and `notification_message`. This endpoint generates a link,
+not a new analysis: no paid model call, Redis write, or retention extension occurs.
+A result missing from Redis returns `404`; one without report text returns `409`.
+
+Open `report_url` in a browser to view a mobile-friendly report page with the
+Grok-written report, original validated alert, structured JSON and source links.
+The URL uses `/api/v1/reports-da0db27189a6e42d/JOB_ID?expires=...&signature=...`.
+It grants read-only access to that one report without an Authorization header.
+**Anyone who has the complete signed URL can read that report.** Treat it as a
+shareable credential; never append `RESULT_API_TOKEN` to messages or URLs.
+
+Links expire seven days after the result's `completed_at`, and stop working sooner
+if the Redis result expires or is removed. Regenerating a link does not extend its
+expiry. The existing `RESULT_API_TOKEN` signs links with a separate HMAC purpose;
+rotating it invalidates all previously issued report links. Individual revocation
+requires removing the stored result (which also removes the analysis).
+
+The link origin is derived from your configured `WORKER_URL`, never an incoming
+Host header. Pages escape model text and JSON, load no external resources, use
+`no-store` and `no-referrer`, and request no search-engine indexing. Indexing
+directives do not replace the signed-link access check. Deploy the updated code,
+including `templates/report.html`; no new environment variables or Pine changes
+are required.
+
+WhatsApp, SMS and email sending are not implemented. A future notification worker
+can send the returned `notification_message` separately from Grok processing.
 
 ### List completed results
 
@@ -213,7 +320,7 @@ environment variable or Redis migration is needed.
   for a response. Queue publishing has a 0.5-second per-operation timeout and no
   inline retries. Cold starts, DNS, and network delays still require deployment
   measurement; this is not a guaranteed total response deadline.
-- QStash is configured for five retries and a 270-second delivery timeout. Monitor
+- QStash is configured for five retries and a 330-second delivery timeout. Monitor
   its delivery logs and dead-letter queue, and replay exhausted jobs after fixing
   the cause. Check your QStash plan supports these settings.
 - QStash deduplicates identical publish IDs for ten minutes. Redis suppresses
@@ -222,14 +329,14 @@ environment variable or Redis migration is needed.
   and requires fixing the sender.
 - A token-owned Redis lease prevents concurrent processing; Lua atomically stores
   the result and releases the lock. Worker failures return `503`; a killed worker's
-  lease expires in 300 seconds so a later retry can recover.
+  lease expires in 360 seconds so a later retry can recover.
 - This is at-least-once delivery, not exactly-once billing: a crash after a model
   call but before storing its result can cause another paid call on retry. Alerts
   older than 24 hours at processing time produce `Watch` without a model call.
-- SDK retries are disabled; QStash owns retries. Research requests have a 180-second
-  per-operation timeout (10 seconds for connection establishment) and a 4,000-token
-  output budget; Vercel imposes the invocation's 240-second hard limit. QStash's
-  270-second delivery timeout allows additional time for startup. Search adds
+- SDK retries are disabled; QStash owns retries. Research requests have a 240-second
+  per-operation timeout (20 seconds for connection establishment) and a 4,000-token
+  output budget; Vercel imposes the invocation's 300-second hard limit. QStash's
+  330-second delivery timeout allows additional time for startup. Search adds
   variable latency and charges.
   Measure live requests before relying on this budget; if searches repeatedly
   time out, adjust the Vercel duration, QStash delivery timeout, Redis lock TTL,
