@@ -31,6 +31,8 @@ Configure these variables in the Vercel project; `.env.example` lists them:
 | `RESULT_API_TOKEN` | Separate random token for reading stored results |
 | `XAI_API_KEY` | xAI API credential, available only to the server |
 | `XAI_MODEL` | Optional; defaults to `grok-4.7`; must support Responses API, Web Search, and structured outputs |
+| `WHATSAPP_VERIFY_TOKEN` | Separate random token matching Meta's webhook Verify token field |
+| `WHATSAPP_APP_SECRET` | Meta application's App Secret, used to authenticate WhatsApp deliveries |
 
 Generate distinct random tokens, for example with `openssl rand -hex 32`.
 Do not commit `.env` or actual credentials. `BACKGROUND_ANALYSIS` is no longer used.
@@ -50,6 +52,51 @@ the matching code together. Previously queued jobs retain their original URLs;
 let them drain before changing the path, or replay them to the new path afterward.
 The worker authenticates this token rather than validating QStash signatures;
 any holder of that token can invoke it. Keep it separate from the TradingView token.
+
+## WhatsApp Business incoming webhook
+
+Callback URL:
+`https://trading-api-lac.vercel.app/api/v1/whatsapp-webhook-9119d4cb5e7c7192`
+
+1. Generate a separate verify token with `openssl rand -hex 32`. Set it as
+   `WHATSAPP_VERIFY_TOKEN` in Vercel, and use that same value in Meta's **Verify
+   token** field. Do not use a WhatsApp access token here.
+2. Copy your Meta application's **App Secret** from its app settings into
+   Vercel's `WHATSAPP_APP_SECRET`. This is a different secret from the verify
+   token. The existing `REDIS_URL` is also required for receiving deliveries.
+3. Redeploy with these variables. Ensure Meta can reach the production callback
+   through Vercel Deployment Protection. Enter the callback URL above in Meta,
+   then select **Verify and save**. Leave the client-certificate option off
+   unless you separately configure mutual TLS.
+4. Subscribe to the `messages` webhook field and ensure the app is subscribed
+   to your WhatsApp Business Account. This field delivers incoming messages and
+   outgoing-message status updates. Follow Meta's publishing requirements; the
+   dashboard warns that unpublished apps only receive dashboard test webhooks.
+
+GET verifies `hub.verify_token` and returns `hub.challenge` as plain text. POST
+checks `X-Hub-Signature-256` using HMAC-SHA256 of the exact request body with the
+App Secret before parsing or storing it. The randomized path supplements these
+checks; it does not replace authentication. A plain browser visit without
+verification parameters returns an error by design.
+
+Accepted event envelopes are stored in the existing Redis database as
+`wa:webhook:<event_id>`, with `event_id`, UTC `received_at`, and the complete
+`payload`. Records include message content and sender identifiers, so restrict
+Redis access. They expire after seven days and can currently be inspected in
+the Redis console; the trading-results API does not list this inbox.
+Identical envelopes (ignoring JSON key order and whitespace) are acknowledged
+without overwriting or extending their expiry. Rebatched messages can appear
+in different envelopes; any future message processing should also deduplicate
+by WhatsApp message ID. Batches up to 3 MiB are accepted without changing the
+TradingView endpoint's 128 KiB limit.
+
+Storage failures return `503` so Meta can retry. Logs contain event IDs and
+error types, without message contents or sender numbers. This inbox does not
+send replies, download media, or call Grok; no WhatsApp access token is needed
+for receiving events. Existing trading alerts and reports are independent.
+
+See Meta's [WhatsApp webhook guide](https://developers.facebook.com/documentation/business-messaging/whatsapp/webhooks/overview)
+and [verification and signature documentation](https://developers.facebook.com/docs/graph-api/webhooks/getting-started/).
 
 ## TradingView alert message
 

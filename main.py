@@ -16,6 +16,7 @@ from redis import Redis
 from analysis import analyze
 from models import Alert
 from reports import REPORTS_PATH, valid_job_id, valid_report_signature, with_report
+from whatsapp import create_blueprint as create_whatsapp_blueprint
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
@@ -72,6 +73,9 @@ def redis_client():
         os.environ["REDIS_URL"], decode_responses=True,
         socket_connect_timeout=2, socket_timeout=2,
     )
+
+
+app.register_blueprint(create_whatsapp_blueprint(lambda: redis_client()))
 
 
 def canonical(alert):
