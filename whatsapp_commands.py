@@ -19,7 +19,7 @@ WORKER_PATH = "/api/v1/whatsapp-reply-71f295b68cd903ea"
 TTL = 7 * 86400
 HELP = ("Trade-notify commands:\n/latest NVDA\n/latest NVDA, AAPL\n"
         "/latest NASDAQ:NVDA\n/latest all — list available tickers\n/reset — clear your conversation\n/help\n\n"
-        "Returns the single latest stored recommendation per ticker. "
+        "Returns the single latest stored recommendation per ticker. Missing tickers get a new daily analysis. "
         "Use an exchange prefix if a symbol is ambiguous. Maximum 10 tickers. "
         "Send any text without / to chat about stocks or Trade-notify.")
 
@@ -89,7 +89,7 @@ def publish_job(job_id):
         response.raise_for_status()
 
 
-def recommendations(store, symbols, selected=None):
+def recommendations(store, symbols, selected=None, missing=None):
     # Keep only the newest record per symbol, and fail rather than return a
     # partial scan as though it represented the newest results.
     top = {}
@@ -132,33 +132,41 @@ def recommendations(store, symbols, selected=None):
             replies.append(f"{symbol} is ambiguous. Use one of: {', '.join(matches)}")
             continue
         if not matches:
-            replies.append(f"{symbol}: No stored recommendations available (results expire after 7 days).")
+            if missing is not None:
+                missing.append(symbol)
+                replies.append(f"{symbol}: No stored recommendation. Requesting a daily analysis; I will send the result here when ready.")
+            else:
+                replies.append(f"{symbol}: No stored recommendations available (results expire after 7 days).")
             continue
         ticker = matches[0]
         if selected is not None:
             selected.append(top[ticker][2]["job_id"])
-        lines = [f"{ticker} — latest stored recommendation"]
-        record = top[ticker][2]
-        analysis = record.get("analysis") or {}
-        summary = analysis["notification_text"]
-        lines.append(f"\n{record['completed_at']} | interval {record['alert'].get('interval', 'unknown')}\n{str(summary)[:300]}")
-        entry = analysis.get("entry_range")
-        if entry and analysis.get("decision") == "Buy":
-            lines.append(f"Entry range: {entry['low']}–{entry['high']}")
-            lines.append(f"Stop: {analysis['stop_loss']}")
-            targets = analysis["targets"]
-            if targets:
-                lines.append("Targets (bot order): " + ", ".join(str(target["price"]) for target in targets))
-        if os.environ.get("RESULT_API_TOKEN") and os.environ.get("WORKER_URL"):
-            try:
-                link = with_report(record).get("report_url")
-                if link:
-                    lines.append("Report: " + link)
-            except (ValueError, KeyError, TypeError):
-                pass
-        replies.append("\n".join(lines))
+        replies.append(result_text(top[ticker][2]))
     # Stay below Meta's 4096-character text limit without splitting URLs.
     return [part for text in replies for part in chunks(text)]
+
+
+def result_text(record):
+    ticker = record["alert"]["ticker"]
+    lines = [f"{ticker} — latest stored recommendation"]
+    analysis = record.get("analysis") or {}
+    summary = analysis["notification_text"]
+    lines.append(f"\n{record['completed_at']} | interval {record['alert'].get('interval', 'unknown')}\n{str(summary)[:300]}")
+    entry = analysis.get("entry_range")
+    if entry and analysis.get("decision") == "Buy":
+        lines.append(f"Entry range: {entry['low']}–{entry['high']}")
+        lines.append(f"Stop: {analysis['stop_loss']}")
+        targets = analysis["targets"]
+        if targets:
+            lines.append("Targets (bot order): " + ", ".join(str(target["price"]) for target in targets))
+    if os.environ.get("RESULT_API_TOKEN") and os.environ.get("WORKER_URL"):
+        try:
+            link = with_report(record).get("report_url")
+            if link:
+                lines.append("Report: " + link)
+        except (ValueError, KeyError, TypeError):
+            pass
+    return "\n".join(lines)
 
 
 def chunks(text):
@@ -211,7 +219,12 @@ def process(store, job_id):
             return "awaiting_callback"
         else:
             selected = []
-            texts = recommendations(store, symbols, selected=selected) if symbols else [HELP]
+            missing = []
+            texts = recommendations(store, symbols, selected=selected, missing=missing) if symbols else [HELP]
+            if missing:
+                from on_demand import request_analysis
+                for symbol in missing:
+                    selected.append(request_analysis(store, job_id, job, symbol))
             if symbols and symbols != ["*"]:
                 remember_context(store, job["phone_id"], message["from"], selected)
             store.set(reply_key, json.dumps(texts), nx=True, ex=TTL)

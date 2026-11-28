@@ -16,7 +16,8 @@ def sending(inbox, monkeypatch):
               "WORKER_URL": "https://example.test/api/v1/worker", "WORKER_TOKEN": "worker-test",
               "QSTASH_URL": "https://qstash.test", "QSTASH_TOKEN": "queue-test", "RESULT_API_TOKEN": "result-test",
               "GROK_CALLBACK_TOKEN": "callback-test", "GROK_CHAT_WEBHOOK_URL": "https://chat-bot.test/webhook",
-              "GROK_CHAT_WEBHOOK_KEY": "chat-key-test"}
+              "GROK_CHAT_WEBHOOK_KEY": "chat-key-test",
+              "GROK_WEBHOOK_URL": "https://analysis-bot.test/webhook", "GROK_WEBHOOK_KEY": "analysis-key-test"}
     for name, value in values.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("WHATSAPP_GRAPH_API_VERSION", raising=False)
@@ -123,10 +124,11 @@ def test_exact_exchange_does_not_match_other_exchange(sending):
     assert "NYSE:ABC recommendation 0" in text and "NASDAQ:ABC" not in text
 
 
-def test_missing_results_explained_without_model_call(sending):
+def test_missing_results_request_analysis(sending):
     deliver(sending[0], command_payload("/latest NVDA"))
     run_worker(sending)
-    assert "No stored recommendations" in json.loads(graph_requests(sending)[0].content)["text"]["body"]
+    assert "Requesting a daily analysis" in json.loads(graph_requests(sending)[0].content)["text"]["body"]
+    assert len([r for r in sending[2] if r.url.host == "analysis-bot.test"]) == 1
 
 
 @pytest.mark.parametrize("configured", ["", "19999999999"])

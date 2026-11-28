@@ -72,7 +72,7 @@ def test_signed_link_renders_without_api_token(setup):
     assert response.mimetype == "text/html"
     assert "NASDAQ:NVDA" in response.text
     assert record["analysis"]["recommendation_text"] in response.text
-    assert "Original validated alert" in response.text
+    assert "Original analysis request" in response.text
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert "noindex" in response.headers["X-Robots-Tag"]

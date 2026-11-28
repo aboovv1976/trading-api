@@ -251,12 +251,12 @@ Approved users interact entirely through WhatsApp:
 Commands are case insensitive. Ambiguous bare symbols require an exchange
 prefix; the app asks instead of guessing. Unknown slash commands return help.
 Plain text from approved senders is queued for the separate chat bot webhook.
-`/latest` and `/help` remain deterministic and never call the bot or create
-analysis. `/reset` calls the chat webhook's reset operation.
+`/help` and `/latest all` use stored data only. `/latest TICKER` requests a
+new daily analysis if no stored recommendation exists. `/reset` calls the chat webhook's reset operation.
 Newest means the most recent analysis completion time, across all stored
 intervals/strategies for that ticker. Replies show the completion time, interval,
 short recommendation, and an expiring full-report link when available. No stored
-result produces an explicit unavailable response. Results expire after seven days.
+result triggers on-demand analysis and a WhatsApp reply when ready. Results expire after seven days.
 
 Configure the outgoing access token and phone number ID above, with
 `whatsapp_business_messaging` permission and access to the business account.
@@ -654,3 +654,18 @@ Flask does not load `.env` automatically in this dependency set. Do not point a
 development worker at production Redis. End-to-end QStash testing requires a
 public HTTPS worker URL. Automated tests use fake Redis with actual Lua script
 execution and mocked queue/model calls; they do not contact paid services.
+
+### On-demand recommendations
+
+`/latest NVDA` returns the newest stored recommendation. If none exists, the
+WhatsApp worker requests analysis through `GROK_WEBHOOK_URL` using
+`{"type":"analyze","job_id":"<app-generated ID>","ticker":"NVDA","interval":"1D"}`.
+No TradingView signal, price, or indicators are invented. The existing authenticated
+analysis callback stores the result with `source: "on_demand"` (TradingView jobs use
+`source: "tradingview"`) and queues the recommendation and signed report link back
+to the requesting WhatsApp user. The normal allowlist and 24-hour reply window
+still apply. A single requested ticker sets the conversation's analysis job for
+follow-up questions; multiple tickers leave no single implicit selection.
+`/latest all` only lists available stored tickers. No additional environment
+variables are required. Configure the analysis bot to accept the `analyze` payload
+and return its normal analysis callback with the supplied job ID.

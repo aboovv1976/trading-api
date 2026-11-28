@@ -24,12 +24,12 @@
 </head>
 <body>
 <main>
-  <div class="eyebrow">Trading alert report</div>
+  <div class="eyebrow">Trading analysis report</div>
   <h1>{{ record.alert.ticker }}</h1>
   <span class="decision">{{ record.analysis.decision }}</span>
   <p class="meta">Completed: {{ record.completed_at }}<br>Job: {{ record.job_id }}</p>
   <article aria-label="Recommendation"><pre class="report">{{ record.analysis.recommendation_text }}</pre></article>
-  <details><summary>Original validated alert</summary><pre class="json">{{ alert_json }}</pre></details>
+  <details><summary>Original analysis request</summary><pre class="json">{{ alert_json }}</pre></details>
   <details><summary>Structured analysis</summary><pre class="json">{{ analysis_json }}</pre></details>
   {% if bot_response_json %}
   <details><summary>Complete bot response (as reported)</summary><pre class="json">{{ bot_response_json }}</pre></details>

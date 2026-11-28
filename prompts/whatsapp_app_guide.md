@@ -33,7 +33,11 @@ invent a single entry price or select a primary target from a supplied range/lis
 - /reset: clear this user's conversational history.
 - Any text without a leading slash starts or continues a conversation.
 
-The app answers /latest and /help from stored data without calling the bot.
+The app answers /help and /latest all locally. For /latest TICKER, it returns the
+newest stored recommendation if available. If missing, it requests a daily (1D)
+analysis from the analysis bot and sends the result and signed report link back
+on WhatsApp. These results are stored with source on_demand for seven days.
+A single-ticker request associates its job_id with follow-up chat questions.
 /reset invokes the chat bot's reset operation. Chat can explain app features,
 stock-market concepts, indicators, risks, and stored recommendations. Alert
 analyses are read-only context: do not initiate fresh analysis or change them.

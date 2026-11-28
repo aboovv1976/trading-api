@@ -19,6 +19,7 @@ from pydantic import (
 )
 
 from bot_payloads import RichBotCallback, presentation
+from on_demand import notify
 from recommendations import watch
 from whatsapp_chat import receive as receive_chat_reply
 
@@ -60,18 +61,19 @@ def reject_nonfinite(value):
     raise ValueError("Nonfinite JSON number")
 
 
-def dispatch(store, alert, job_id, fingerprint):
+def dispatch(store, alert, job_id, fingerprint, *, source="tradingview"):
+    payload = alert.model_dump(mode="json") if source == "tradingview" else alert
     if not all(os.environ.get(name) for name in ("GROK_WEBHOOK_URL", "GROK_WEBHOOK_KEY", "GROK_CALLBACK_TOKEN")):
         raise ValueError("Grok bot integration not configured")
     url = httpx.URL(os.environ["GROK_WEBHOOK_URL"])
     if url.scheme != "https" or not url.host or url.userinfo or url.fragment:
         raise ValueError("GROK_WEBHOOK_URL must be HTTPS without user credentials")
-    if (datetime.now(timezone.utc) - alert.time).total_seconds() > PENDING_TTL:
+    if source == "tradingview" and (datetime.now(timezone.utc) - alert.time).total_seconds() > PENDING_TTL:
         raise ValueError("Alert too old for external analysis")
     prefix = "tv:{" + job_id + "}:"
     pending_key = prefix + "bot_pending"
     pending = {"job_id": job_id, "fingerprint": fingerprint,
-               "alert": alert.model_dump(mode="json"),
+               "alert": payload, "source": source,
                "submitted_at": datetime.now(timezone.utc).isoformat()}
     store.set(pending_key, json.dumps(pending), nx=True, ex=PENDING_TTL)
     existing = store.get(pending_key)
@@ -83,7 +85,7 @@ def dispatch(store, alert, job_id, fingerprint):
     # the callback URL/key separately in the bot's trusted automation settings.
     with httpx.Client(timeout=httpx.Timeout(10, connect=3), follow_redirects=False) as client:
         response = client.post(str(url), headers={"Authorization": "Bearer " + os.environ["GROK_WEBHOOK_KEY"]},
-                               json={"job_id": job_id, **alert.model_dump(mode="json")})
+                               json={"job_id": job_id, **payload})
         response.raise_for_status()
     store.set(prefix + "bot_sent", "accepted", ex=PENDING_TTL)
 
@@ -154,6 +156,7 @@ def create_blueprint(redis_factory):
                 if previous:
                     if store.get(prefix + "bot_callback_hash") == callback_hash:
                         previous_record = json.loads(previous)
+                        notify(store, previous_record)
                         ack = {"status": previous_record.get("status", "completed"), "job_id": job_id, "duplicate": True}
                         if ack["status"] == "error":
                             ack["reason"] = previous_record["reason"]
@@ -183,7 +186,7 @@ def create_blueprint(redis_factory):
                 else:
                     analysis = None
                 result = {"job_id": job_id, "fingerprint": pending["fingerprint"], "alert": pending["alert"],
-                          "status": status,
+                          "status": status, "source": pending.get("source", "tradingview"),
                           "analysis": analysis.model_dump(mode="json") if analysis is not None else None,
                           "completed_at": datetime.now(timezone.utc).isoformat(),
                           "analysis_backend": "grok_bot", "source_provenance": "bot_reported"}
@@ -202,6 +205,7 @@ def create_blueprint(redis_factory):
                     return jsonify(error="Result already exists with different content"), 409
                 if saved == 0:
                     return jsonify(error="Unknown or expired pending job"), 404
+                notify(store, result)
             current_app.logger.info("Grok callback stored job_id=%s", job_id)
             ack = {"status": status, "job_id": job_id, "duplicate": saved == 2}
             if status == "error":

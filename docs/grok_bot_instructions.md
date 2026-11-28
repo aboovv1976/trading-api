@@ -134,3 +134,11 @@ Duplicate callbacks do not overwrite data or extend the seven-day result expiry.
 The app keeps the validated original alert and its own callback-receipt time
 separately from the bot's reported metadata. A copy may also be posted in the
 bot's own chat, without credentials.
+
+## On-demand requests
+
+The same webhook also receives `{"type":"analyze","job_id":"<64 hex characters>",
+"ticker":"NVDA","interval":"1D"}` when a user requests a ticker absent from the
+result store. Research the ticker without requiring TradingView indicators, a
+signal, or an alert price. Do not invent an alert trigger or supplied inputs.
+Return the same completed/rejected callback contract and supplied `job_id`.
