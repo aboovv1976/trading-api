@@ -116,21 +116,23 @@ analysis in a rejection. Rejection is terminal; it does not create a recommendat
 The completed/rejected schemas describe the intended formats. If an authenticated
 callback has valid JSON and identifies a pending job but its format or ticker is
 unexpected, or the app cannot interpret it, the app records an error outcome
-instead of discarding it. HTTP 200 with `status=error` acknowledges this terminal
+instead of discarding it. HTTP 200 with `status=error` acknowledges this
 error record. The original response and a diagnostic reason remain available in
-the app's JSON results API; no recommendation or report is created. Do not resend
-or generate a different analysis for the same job to bypass this error. Identical
-delivery retries are safe; conflicting terminal outcomes return 409.
+the app's JSON results API; no recommendation or report is created. A corrected, valid completed callback with the same job ID and original ticker
+may replace a stored error until its seven-day expiry. Completed and explicitly
+rejected results cannot be replaced. Identical delivery retries are safe; other
+conflicting outcomes return 409.
 
 ## Delivery and retries
 
-Only existing pending jobs can be completed or rejected; pending jobs expire
-after 24 hours. HTTP 200 acknowledges storage. Retry network failures or HTTP 503
+New results require an existing pending job; pending jobs expire after 24 hours.
+Correcting a stored error instead uses the original request retained in that error. HTTP 200 acknowledges storage. Retry network failures or HTTP 503
 with backoff and the same body/job_id. HTTP 400 is reserved for unparseable JSON
 or a missing/invalid job_id that cannot be associated with a job. On 401, correct
 authentication. On 404, the job is unknown/expired; on 409, a different
 result already exists. Do not change the job_id to bypass those responses.
 Duplicate callbacks do not overwrite data or extend the seven-day result expiry.
+An accepted correction receives a new completion timestamp and seven-day retention.
 The app keeps the validated original alert and its own callback-receipt time
 separately from the bot's reported metadata. A copy may also be posted in the
 bot's own chat, without credentials.

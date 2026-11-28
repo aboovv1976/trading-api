@@ -19,7 +19,7 @@ WORKER_PATH = "/api/v1/whatsapp-reply-71f295b68cd903ea"
 TTL = 7 * 86400
 HELP = ("Trade-notify commands:\n/latest NVDA\n/latest NVDA, AAPL\n"
         "/latest NASDAQ:NVDA\n/latest all — list available tickers\n/reset — clear your conversation\n/help\n\n"
-        "Returns the single latest stored recommendation per ticker. Missing tickers get a new daily analysis. "
+        "Returns the single latest stored recommendation per ticker. Missing or stale recommendations get a new daily analysis. "
         "Use an exchange prefix if a symbol is ambiguous. Maximum 10 tickers. "
         "Send any text without / to chat about stocks or Trade-notify.")
 
@@ -125,6 +125,9 @@ def recommendations(store, symbols, selected=None, missing=None):
         if not top:
             return ["No tickers with stored recommendations available (results expire after 7 days)."]
         return chunks("Available tickers with stored recommendations:\n" + "\n".join(sorted(top)))
+    max_age = int(os.environ.get("ANALYSIS_MAX_AGE_SECONDS", "3600"))
+    if max_age <= 0:
+        raise ValueError("ANALYSIS_MAX_AGE_SECONDS must be a positive integer")
     replies = []
     for symbol in symbols:
         matches = sorted(t for t in top if t == symbol or (":" not in symbol and t.split(":")[-1] == symbol))
@@ -139,6 +142,10 @@ def recommendations(store, symbols, selected=None, missing=None):
                 replies.append(f"{symbol}: No stored recommendations available (results expire after 7 days).")
             continue
         ticker = matches[0]
+        if missing is not None and time.time() - top[ticker][0] > max_age:
+            missing.append(ticker)
+            replies.append(f"{ticker}: Stored recommendation is stale. Requesting a new daily analysis; I will send the result here when ready.")
+            continue
         if selected is not None:
             selected.append(top[ticker][2]["job_id"])
         replies.append(result_text(top[ticker][2]))

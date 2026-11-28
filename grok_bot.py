@@ -30,9 +30,13 @@ PROVENANCE = "External bot sources are bot-reported; xAI response citation metad
 COMMIT = """
 if redis.call('exists', KEYS[1]) == 1 then
     if redis.call('get', KEYS[3]) == ARGV[2] then return 2 end
-    return -1
+    local previous = redis.call('get', KEYS[1])
+    if previous ~= ARGV[5] or cjson.decode(previous).status ~= 'error'
+        or cjson.decode(ARGV[1]).status ~= 'completed' then return -1 end
+else
+    if ARGV[5] ~= '' then return -1 end
+    if redis.call('get', KEYS[2]) ~= ARGV[3] then return 0 end
 end
-if redis.call('get', KEYS[2]) ~= ARGV[3] then return 0 end
 redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[4])
 redis.call('set', KEYS[3], ARGV[2], 'EX', ARGV[4])
 redis.call('del', KEYS[2])
@@ -161,11 +165,12 @@ def create_blueprint(redis_factory):
                         if ack["status"] == "error":
                             ack["reason"] = previous_record["reason"]
                         return jsonify(ack), 200
-                    return jsonify(error="Result already exists with different content"), 409
+                    if json.loads(previous)["status"] != "error" or not isinstance(body, RichBotCallback):
+                        return jsonify(error="Result already exists with different content"), 409
                 pending_raw = store.get(prefix + "bot_pending")
-                if pending_raw is None:
+                if pending_raw is None and not previous:
                     return jsonify(error="Unknown or expired pending job"), 404
-                pending = json.loads(pending_raw)
+                pending = json.loads(previous) if previous else json.loads(pending_raw)
                 if isinstance(body, RichBotCallback):
                     expected_ticker = pending["alert"]["ticker"].upper()
                     supplied_ticker = body.ticker.upper()
@@ -199,8 +204,10 @@ def create_blueprint(redis_factory):
                         result["validation_errors"] = validation_errors
                 if not isinstance(body, BotRejection):
                     result["bot_response"] = original
+                if previous and status != "completed":
+                    return jsonify(error="Only a valid completed callback can replace a stored error"), 409
                 saved = store.eval(COMMIT, 3, prefix + "result", prefix + "bot_pending", prefix + "bot_callback_hash",
-                                   json.dumps(result), callback_hash, pending_raw, TTL)
+                                   json.dumps(result), callback_hash, pending_raw or "", TTL, previous or "")
                 if saved == -1:
                     return jsonify(error="Result already exists with different content"), 409
                 if saved == 0:

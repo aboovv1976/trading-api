@@ -335,3 +335,30 @@ def test_interpretation_exception_is_recorded_without_leaking_exception_text(cli
     assert record["error_type"] == "unexpected_bot_response"
     assert record["validation_errors"] == [{"field": "recommendation", "type": "RuntimeError"}]
     assert "private exception details" not in json.dumps(record)
+
+
+def test_tradingview_error_can_be_corrected(client, payload, bot):
+    job = dispatch(client, payload)
+    assert post_result(client, {"job_id": job, "bad": True}).json["status"] == "error"
+    packet = callback(job)
+    assert post_result(client, packet).json["status"] == "completed"
+    with main.redis_client() as store:
+        assert json.loads(store.get("tv:{" + job + "}:result"))["source"] == "tradingview"
+    packet["summary"] = "Changed completed analysis"
+    assert post_result(client, packet).status_code == 409
+
+
+def test_atomic_recovery_cannot_overwrite_a_concurrent_completion(client, payload, bot):
+    job = dispatch(client, payload)
+    assert post_result(client, {"job_id": job, "bad": True}).status_code == 200
+    prefix = "tv:{" + job + "}:"
+    with main.redis_client() as store:
+        previous = store.get(prefix + "result")
+    assert post_result(client, callback(job)).status_code == 200
+    with main.redis_client() as store:
+        completed = store.get(prefix + "result")
+        result = json.loads(completed)
+        result["analysis"]["rationale"] = "Competing correction"
+        assert store.eval(grok_bot.COMMIT, 3, prefix + "result", prefix + "bot_pending", prefix + "bot_callback_hash",
+                          json.dumps(result), "competing-hash", "", grok_bot.TTL, previous) == -1
+        assert store.get(prefix + "result") == completed

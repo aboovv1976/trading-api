@@ -143,8 +143,11 @@ are included when available, without copying input values into the diagnostics.
 The callback returns HTTP 200 with `status=error`, so the bot need not repeatedly
 deliver a response the app cannot use. Error outcomes appear in the JSON result
 APIs, expire after seven days, and produce no recommendation/report. Retries of
-the same error are idempotent; a different response cannot overwrite a terminal
-outcome. These errors finish the job, just like an explicit bot rejection.
+the same error are idempotent. A valid completed callback for the same job and
+original ticker can replace a stored error, atomically, until that error expires.
+The corrected result gets a new completion time and seven-day retention. Completed
+and explicitly rejected results cannot be replaced. On-demand corrections queue a
+new WhatsApp reply even when the earlier error notice was already sent.
 
 The analysis flow is:
 
@@ -162,7 +165,7 @@ acceptance. Its `202` does not mean analysis is complete. Retries after accepted
 dispatch do not trigger a new run. If a network timeout makes acceptance uncertain,
 the trigger may receive the job again: the bot must deduplicate by job_id. Callback
 retries with the same normalized analysis return 200 without changing the record
-or expiry; different results return 409. Unknown/expired jobs return 404. Invalid
+or expiry; different results return 409 except a valid completion correcting a stored error. Unknown/expired jobs return 404. Invalid
 formats for a known pending job are stored as error outcomes with HTTP 200.
 Unparseable JSON or a missing/invalid job ID returns 400 because no job can be
 associated, bad authentication returns 401, and storage failures return 503. Accepted
@@ -657,7 +660,8 @@ execution and mocked queue/model calls; they do not contact paid services.
 
 ### On-demand recommendations
 
-`/latest NVDA` returns the newest stored recommendation. If none exists, the
+`/latest NVDA` returns the newest stored recommendation. If none exists, or the newest recommendation exceeds
+`ANALYSIS_MAX_AGE_SECONDS` (default `3600`, measured from app completion time), the
 WhatsApp worker requests analysis through `GROK_WEBHOOK_URL` using
 `{"type":"analyze","job_id":"<app-generated ID>","ticker":"NVDA","interval":"1D"}`.
 No TradingView signal, price, or indicators are invented. The existing authenticated
@@ -666,6 +670,8 @@ analysis callback stores the result with `source: "on_demand"` (TradingView jobs
 to the requesting WhatsApp user. The normal allowlist and 24-hour reply window
 still apply. A single requested ticker sets the conversation's analysis job for
 follow-up questions; multiple tickers leave no single implicit selection.
-`/latest all` only lists available stored tickers. No additional environment
-variables are required. Configure the analysis bot to accept the `analyze` payload
+`/latest all` only lists available stored tickers, including older results. Set
+`ANALYSIS_MAX_AGE_SECONDS=3600` in Vercel to configure the freshness window in
+positive whole seconds; omitting it defaults to one hour. Refresh happens on a
+new `/latest TICKER` request, rather than on a timer. Configure the analysis bot to accept the `analyze` payload
 and return its normal analysis callback with the supplied job ID.

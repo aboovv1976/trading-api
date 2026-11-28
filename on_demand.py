@@ -31,7 +31,9 @@ def notify(store, record):
     raw = store.get("wa:on_demand:" + job_id)
     if not raw:
         return
-    key = "wa:command:" + job_id
+    # A recovered result needs a new delivery even if the error was already sent.
+    delivery_id = hashlib.sha256(f"analysis_reply:{job_id}:{record['status']}".encode()).hexdigest()
+    key = "wa:command:" + delivery_id
     if store.exists(key + ":done"):
         return
     if record["status"] == "completed":
@@ -44,4 +46,4 @@ def notify(store, record):
         pipe.set(key, raw, nx=True, ex=TTL)
         pipe.set(key + ":replies", json.dumps(chunks(text)), nx=True, ex=TTL)
         pipe.execute()
-    publish_job(job_id)
+    publish_job(delivery_id)

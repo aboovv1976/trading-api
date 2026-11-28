@@ -149,3 +149,68 @@ def test_dispatch_retry_reuses_same_job(sending, monkeypatch):
     monkeypatch.setattr(grok_bot, "dispatch", original)
     assert run_worker(sending).status_code == 200
     assert len(requests(sending)) == 1
+
+
+def test_error_can_be_corrected_after_error_notification_sent(sending):
+    job = start(sending)
+    broken = {"job_id": job, "unexpected": True}
+    assert post_result(sending[0], broken).json["status"] == "error"
+    assert run_notification(sending).status_code == 200
+    assert "Analysis error" in json.loads(graph_requests(sending)[-1].content)["text"]["body"]
+    packet = callback(job)
+    response = post_result(sending[0], packet)
+    assert response.status_code == 200 and response.json["status"] == "completed"
+    assert run_notification(sending).status_code == 200
+    assert "AAPL Buy" in json.loads(graph_requests(sending)[-1].content)["text"]["body"]
+    assert post_result(sending[0], packet).json["duplicate"]
+    assert run_notification(sending).status_code == 200
+    assert len(graph_requests(sending)) == 3
+    assert post_result(sending[0], broken).status_code == 409
+    with sending[1]() as store:
+        saved = json.loads(store.get("tv:{" + job + "}:result"))
+        assert saved["status"] == "completed" and saved["source"] == "on_demand"
+        assert "error_type" not in saved and "reason" not in saved
+
+
+def test_invalid_or_mismatched_correction_cannot_replace_error(sending):
+    job = start(sending)
+    original = {"job_id": job, "unexpected": True}
+    assert post_result(sending[0], original).status_code == 200
+    wrong = callback(job)
+    wrong["ticker"] = "MSFT"
+    assert post_result(sending[0], wrong).status_code == 409
+    assert post_result(sending[0], {"job_id": job, "status": "rejected", "reason": "No data"}).status_code == 409
+    with sending[1]() as store:
+        assert json.loads(store.get("tv:{" + job + "}:result"))["bot_response"] == original
+
+
+@pytest.mark.parametrize("age,threshold,refresh", [(3599, None, False), (3601, None, True),
+                                                   (900, "600", True), (3601, "7200", False)])
+def test_recommendation_age_controls_refresh(sending, monkeypatch, age, threshold, refresh):
+    from datetime import datetime, timedelta, timezone
+    if threshold is None:
+        monkeypatch.delenv("ANALYSIS_MAX_AGE_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("ANALYSIS_MAX_AGE_SECONDS", threshold)
+    seed(sending[1], "NASDAQ:AAPL", count=1)
+    with sending[1]() as store:
+        key = next(store.scan_iter(match="tv:*:result"))
+        record = json.loads(store.get(key))
+        record["completed_at"] = (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
+        store.set(key, json.dumps(record), ex=604800)
+    assert deliver(sending[0], command_payload("/latest AAPL")).status_code == 200
+    assert run_worker(sending).status_code == 200
+    assert bool(requests(sending)) == refresh
+    if refresh:
+        assert json.loads(requests(sending)[0].content)["ticker"] == "NASDAQ:AAPL"
+        assert "stale" in json.loads(graph_requests(sending)[-1].content)["text"]["body"]
+    with sending[1]() as store:
+        assert "NASDAQ:AAPL" in commands.recommendations(store, ["*"])[0]
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+def test_invalid_freshness_configuration_does_not_dispatch(sending, monkeypatch, value):
+    monkeypatch.setenv("ANALYSIS_MAX_AGE_SECONDS", value)
+    deliver(sending[0], command_payload("/latest AAPL"))
+    assert run_worker(sending).status_code == 503
+    assert not requests(sending)

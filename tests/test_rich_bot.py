@@ -131,7 +131,8 @@ def test_compact_callback_is_recorded_as_error_not_interpreted_as_recommendation
     record = get_record(client, rich_body)
     assert record["status"] == "error" and record["analysis"] is None
     assert record["bot_response"] == compact
-    assert post_result(client, rich_body).status_code == 409
+    assert post_result(client, rich_body).status_code == 200
+    assert get_record(client, rich_body)["status"] == "completed"
 
 
 def test_unsupported_action_is_preserved_without_inventing_buy(client, rich_body):

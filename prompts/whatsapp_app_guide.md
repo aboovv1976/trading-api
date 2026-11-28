@@ -34,9 +34,12 @@ invent a single entry price or select a primary target from a supplied range/lis
 - Any text without a leading slash starts or continues a conversation.
 
 The app answers /help and /latest all locally. For /latest TICKER, it returns the
-newest stored recommendation if available. If missing, it requests a daily (1D)
-analysis from the analysis bot and sends the result and signed report link back
+newest stored recommendation if fresh. Missing or stale recommendations trigger a daily (1D)
+analysis from the analysis bot; the app sends the result and signed report link back
 on WhatsApp. These results are stored with source on_demand for seven days.
+Freshness defaults to one hour from app completion time and is configurable by
+the operator through ANALYSIS_MAX_AGE_SECONDS. Refresh occurs on /latest TICKER,
+not on a timer. /latest all includes older stored tickers.
 A single-ticker request associates its job_id with follow-up chat questions.
 /reset invokes the chat bot's reset operation. Chat can explain app features,
 stock-market concepts, indicators, risks, and stored recommendations. Alert
