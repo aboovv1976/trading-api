@@ -285,6 +285,18 @@ the cap returns an explanatory response instead of incomplete results.
 
 ### Bot conversations, history and app information
 
+For a message that receives no reply, first test `/help`, which bypasses the chat
+bot. Application INFO logs show incoming messages being filtered or queued,
+worker outcomes, bot dispatch/callback, and Meta send acceptance. An HTTP 200
+on the incoming webhook alone is not proof that a reply was queued: it also
+acknowledges unapproved senders and status-only events. Look for
+`reason=sender_not_allowed`, `reason=business_phone_mismatch`, or named missing
+configuration variables, then the correlated job ID. If a message was queued,
+check QStash delivery to `/api/v1/whatsapp-reply-71f295b68cd903ea`. Meta send failures
+log HTTP status and numeric error/subcode, without provider text, message content,
+phone numbers or tokens. Progress logs must be viewed on the deployment containing
+these changes; deploying environment variables alone does not update source code.
+
 Configure `GROK_CHAT_WEBHOOK_URL` and `GROK_CHAT_WEBHOOK_KEY` separately from the
 TradingView automation. They use the same `GROK_CALLBACK_TOKEN` and existing
 callback URL. The app uses no direct model calls and sends no guide or transcript

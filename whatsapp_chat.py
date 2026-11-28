@@ -5,7 +5,7 @@ import json
 import os
 
 import httpx
-from flask import jsonify
+from flask import current_app, jsonify
 
 TTL = 7 * 86400
 COMMIT = """
@@ -42,7 +42,9 @@ def remember_context(store, phone_id, sender, jobs):
 
 
 def dispatch(store, job_id, job, reset=False):
-    if not all(os.environ.get(name) for name in ("GROK_CHAT_WEBHOOK_URL", "GROK_CHAT_WEBHOOK_KEY", "GROK_CALLBACK_TOKEN")):
+    missing = [name for name in ("GROK_CHAT_WEBHOOK_URL", "GROK_CHAT_WEBHOOK_KEY", "GROK_CALLBACK_TOKEN") if not os.environ.get(name)]
+    if missing:
+        current_app.logger.error("WhatsApp chat configuration missing variables=%s", ",".join(missing))
         raise ValueError("Chat bot webhook not configured")
     url = httpx.URL(os.environ["GROK_CHAT_WEBHOOK_URL"])
     if url.scheme != "https" or not url.host or url.userinfo or url.fragment:
@@ -93,6 +95,7 @@ def dispatch(store, job_id, job, reset=False):
         response = client.post(str(url), headers={"Authorization": "Bearer " + os.environ["GROK_CHAT_WEBHOOK_KEY"]}, json=pending["body"])
         response.raise_for_status()
     store.set(key + ":sent", "accepted", ex=TTL)
+    current_app.logger.info("WhatsApp chat dispatched job_id=%s type=%s status=awaiting_callback", job_id, pending["body"]["type"])
 
 
 def current(store, job_id):
@@ -147,4 +150,5 @@ def receive(store, original):
         # Re-publish on duplicate callbacks too: a previous queue publish may
         # have failed after committing the reply. Sending is deduplicated later.
         publish_job(job_id)
+    current_app.logger.info("WhatsApp chat callback job_id=%s status=%s duplicate=%s", job_id, status, saved == 2)
     return jsonify(status=status, conversation_id=identifier, message_id=message_id, duplicate=saved == 2), 200

@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 
 import httpx
+from flask import current_app
 
 from reports import with_report
 from whatsapp_chat import current as chat_current
@@ -48,14 +49,21 @@ def enqueue(store, message, phone_id):
     content = message.get("text")
     text = content.get("body") if message.get("type") == "text" and isinstance(content, dict) else None
     if not isinstance(text, str) or not text.strip():
+        current_app.logger.info("WhatsApp message ignored reason=not_text_or_empty")
         return
     if not isinstance(message.get("id"), str) or not message["id"]:
         raise ValueError("Missing WhatsApp message ID")
     # Only the configured business number can trigger an outgoing message.
     configured_phone = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
-    if not configured_phone or phone_id != configured_phone:
+    if not configured_phone:
+        current_app.logger.warning("WhatsApp message ignored reason=business_phone_not_configured")
         return
-    if not all(os.environ.get(n) for n in ("WHATSAPP_ACCESS_TOKEN", "WORKER_TOKEN", "WORKER_URL", "QSTASH_URL", "QSTASH_TOKEN")):
+    if phone_id != configured_phone:
+        current_app.logger.warning("WhatsApp message ignored reason=business_phone_mismatch")
+        return
+    missing = [name for name in ("WHATSAPP_ACCESS_TOKEN", "WORKER_TOKEN", "WORKER_URL", "QSTASH_URL", "QSTASH_TOKEN") if not os.environ.get(name)]
+    if missing:
+        current_app.logger.error("WhatsApp reply configuration missing variables=%s", ",".join(missing))
         raise ValueError("WhatsApp replies not configured")
     job_id = hashlib.sha256((phone_id + ":" + message["id"]).encode()).hexdigest()
     key = "wa:command:" + job_id
@@ -64,6 +72,7 @@ def enqueue(store, message, phone_id):
     if store.exists(key + ":done"):
         return
     publish_job(job_id)
+    current_app.logger.info("WhatsApp message queued job_id=%s kind=%s", job_id, "command" if text.lstrip().startswith("/") else "chat")
 
 
 def publish_job(job_id):
@@ -237,7 +246,15 @@ def process(store, job_id):
                 response.raise_for_status()
             if not response.is_success:
                 store.set(part_key, "rejected:" + str(response.status_code), ex=TTL)
+                try:
+                    error = response.json().get("error", {})
+                    code = error.get("code") if isinstance(error.get("code"), int) else None
+                    subcode = error.get("error_subcode") if isinstance(error.get("error_subcode"), int) else None
+                except (ValueError, AttributeError):
+                    code = subcode = None
+                current_app.logger.error("WhatsApp send rejected job_id=%s part=%s http_status=%s code=%s subcode=%s", job_id, index, response.status_code, code, subcode)
                 raise ValueError("Meta rejected WhatsApp reply")
             store.set(part_key, "accepted", ex=TTL)
+            current_app.logger.info("WhatsApp send accepted job_id=%s part=%s", job_id, index)
     store.set(key + ":done", delivery_status, ex=TTL)
     return delivery_status

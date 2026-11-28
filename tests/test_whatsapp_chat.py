@@ -248,3 +248,10 @@ def test_late_callback_does_not_send_after_whatsapp_window(sending):
     callback(sending)
     run_last_worker(sending)
     assert not graph_requests(sending)
+
+
+def test_missing_chat_key_is_named_in_logs_without_exposing_other_values(sending, monkeypatch, caplog):
+    monkeypatch.delenv("GROK_CHAT_WEBHOOK_KEY")
+    assert send_turn(sending, "private user message").status_code == 503
+    assert "missing variables=GROK_CHAT_WEBHOOK_KEY" in caplog.text
+    assert "private user message" not in caplog.text and "access-test" not in caplog.text

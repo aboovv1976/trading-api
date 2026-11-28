@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from reports import REPORTS_PATH, valid_job_id, valid_report_signature, with_rep
 from whatsapp import create_blueprint as create_whatsapp_blueprint
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
 LOCK_TTL = 360  # Longer than the configured 300-second Vercel invocation.
 QSTASH_DELIVERY_TIMEOUT = 330  # Allows for invocation startup and shutdown.

@@ -30,6 +30,8 @@ def permitted_payload(payload):
                     raise ValueError("Invalid WhatsApp message array")
                 if field in value:
                     filtered[field] = [item for item in items if allowed(item.get(sender_field))]
+                    if field == "messages" and len(filtered[field]) != len(items):
+                        current_app.logger.info("WhatsApp messages ignored reason=sender_not_allowed count=%s", len(items) - len(filtered[field]))
             if filtered.get("messages") or filtered.get("statuses"):
                 changes.append({**change, "value": filtered})
         if changes:
@@ -89,6 +91,7 @@ def create_blueprint(redis_factory):
         except (ValueError, UnicodeError, RecursionError):
             return jsonify(error="Invalid WhatsApp event"), 400
         if payload is None:
+            current_app.logger.info("WhatsApp webhook ignored event_id=%s reason=no_allowed_messages_or_statuses", event_id)
             return jsonify(status="ignored"), 200
         record = json.dumps({
             "event_id": event_id,
@@ -124,6 +127,7 @@ def create_blueprint(redis_factory):
         try:
             with redis_factory() as store:
                 status = process(store, job_id)
+            current_app.logger.info("WhatsApp worker job_id=%s status=%s", job_id, status or "completed")
             return jsonify(status=status or "completed"), 200
         except Exception as exc:
             current_app.logger.error("WhatsApp command failed job_id=%s (%s)", job_id, type(exc).__name__)

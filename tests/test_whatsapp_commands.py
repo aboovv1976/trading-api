@@ -288,3 +288,30 @@ def test_meta_redirect_is_not_reported_as_success(sending, monkeypatch):
     assert result.status_code == 200 and result.json["status"] == "delivery_failed"
     assert run_worker(sending).json["status"] == "delivery_failed"
     assert http.post.call_count == 1
+
+
+def test_unapproved_sender_log_explains_ignore_without_message_or_phone(sending, monkeypatch, caplog):
+    monkeypatch.setenv("WHATSAPP_ALLOWED_NUMBERS", "19999999999")
+    body = command_payload("private message text")
+    assert deliver(sending[0], body).status_code == 200
+    assert "reason=sender_not_allowed" in caplog.text
+    assert "private message text" not in caplog.text and "15555550123" not in caplog.text
+
+
+def test_phone_id_mismatch_log_explains_missing_queue(sending, caplog):
+    payload = command_payload("private message text")
+    payload["entry"][0]["changes"][0]["value"]["metadata"]["phone_number_id"] = "other-id"
+    assert deliver(sending[0], payload).status_code == 200
+    assert "reason=business_phone_mismatch" in caplog.text
+    assert not sending[2]
+    assert "private message text" not in caplog.text
+
+
+def test_meta_error_logs_codes_without_provider_message(sending, monkeypatch, caplog):
+    deliver(sending[0], command_payload("/help"))
+    request = httpx.Request("POST", "https://graph.facebook.com/test")
+    fake_http(monkeypatch, [httpx.Response(401, request=request, json={"error": {"code": 190,
+        "error_subcode": 463, "message": "private provider details"}})])
+    assert run_worker(sending).status_code == 503
+    assert "http_status=401 code=190 subcode=463" in caplog.text
+    assert "private provider details" not in caplog.text
