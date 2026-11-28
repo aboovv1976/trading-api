@@ -21,7 +21,7 @@ HELP = ("Trade-notify commands:\n/latest NVDA\n/latest NVDA, AAPL\n"
         "/latest NASDAQ:NVDA\n/latest all — list available tickers\n/reset — clear your conversation\n/help\n\n"
         "Returns the single latest stored recommendation per ticker. "
         "Use an exchange prefix if a symbol is ambiguous. Maximum 10 tickers. "
-        "Lookups never call the bot. /reset resets bot history. Send any text without / to chat about stocks or Trade-notify.")
+        "Send any text without / to chat about stocks or Trade-notify.")
 
 
 def allowed(sender):
