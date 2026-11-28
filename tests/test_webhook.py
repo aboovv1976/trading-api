@@ -1,16 +1,15 @@
 import json
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import fakeredis
 import httpx
 import pytest
-from pydantic import ValidationError
 
-import analysis
+from recommendations import watch
 import main
-from models import Alert, Recommendation
+from grok_bot import TTL as GROK_RESULT_TTL
+from models import Alert
 
 WEBHOOK = "/api/v1/tv-alert-x7k9m2p"
 WORKER = "/api/v1/analyze-e8f8323f5eecdfce"
@@ -34,17 +33,18 @@ def setup(monkeypatch):
         "QSTASH_URL": "https://qstash-us-east-1.upstash.io",
         "WORKER_TOKEN": "worker-test", "WORKER_URL": "https://example.com" + WORKER,
         "RESULT_API_TOKEN": "result-test", "REDIS_URL": "redis://unused",
-        "XAI_API_KEY": "xai-test",
+        "GROK_WEBHOOK_URL": "https://bot.example/webhook", "GROK_WEBHOOK_KEY": "bot-test",
+        "GROK_CALLBACK_TOKEN": "callback-test",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
     server = fakeredis.FakeServer()
     monkeypatch.setattr(main, "redis_client", lambda: fakeredis.FakeRedis(server=server, decode_responses=True))
     monkeypatch.setattr(main, "publish", MagicMock())
-    monkeypatch.setattr(main, "analyze", MagicMock(return_value=analysis.watch("Mock analysis")))
-    monkeypatch.delenv("XAI_MODEL", raising=False)
-    # Tests must never make a paid model request accidentally.
-    monkeypatch.setattr(analysis, "OpenAI", MagicMock(side_effect=AssertionError("Unexpected model call")))
+    def pending(store, alert, job_id, fingerprint):
+        store.set("tv:{" + job_id + "}:bot_pending", json.dumps({
+            "fingerprint": fingerprint, "alert": alert.model_dump(mode="json")}), ex=86400)
+    monkeypatch.setattr(main, "dispatch_grok_bot", MagicMock(side_effect=pending))
     main.app.config.update(TESTING=True)
 
 
@@ -55,6 +55,21 @@ def client():
 
 def queued(payload):
     return {key: value for key, value in payload.items() if key != "secret"}
+
+
+def complete(client, payload, recommendation=None):
+    from grok_bot import CALLBACK_PATH
+    processed = client.post(WORKER, json=queued(payload), headers=AUTH)
+    assert processed.status_code == 202
+    return client.post(CALLBACK_PATH, headers={"Authorization": "Bearer callback-test"}, json={
+        "job_id": processed.json["job_id"],
+        "status": "completed", "ticker": payload["ticker"],
+        "recommendation": {"action": "wait"}, "analysis": {},
+        "summary": (recommendation or watch("Insufficient data")).recommendation_text,
+        "reasons": [(recommendation or watch("Insufficient data")).rationale],
+        "recommendation_text": (recommendation or watch("Insufficient data")).recommendation_text,
+        "notification_text": (recommendation or watch("Insufficient data")).notification_text,
+    })
 
 
 def test_accepts_only_after_queue_publish(client, payload):
@@ -110,7 +125,7 @@ def test_oversized_body(client):
 
 
 def test_missing_config_does_not_break_health(client, monkeypatch):
-    monkeypatch.delenv("XAI_API_KEY")
+    monkeypatch.delenv("GROK_WEBHOOK_KEY")
     monkeypatch.delenv("TV_WEBHOOK_SECRET")
     assert client.get("/").status_code == 200
     assert client.get("/health").json == {"status": "ok"}
@@ -123,27 +138,25 @@ def test_worker_requires_own_token(client, payload):
     assert client.post(WORKER, json=queued(payload), headers={"Authorization": "Bearer tv-test"}).status_code == 401
 
 
-def test_worker_stores_result_and_suppresses_duplicates(client, payload, monkeypatch):
-    run = MagicMock(return_value=analysis.watch("Insufficient data"))
-    monkeypatch.setattr(main, "analyze", run)
-    first = client.post(WORKER, json=queued(payload), headers=AUTH)
+def test_worker_dispatches_and_callback_stores_result_without_redispatch(client, payload):
+    processed = complete(client, payload)
+    assert processed.status_code == 200
     second = client.post(WORKER, json=queued(payload), headers=AUTH)
-    assert first.status_code == second.status_code == 200
-    assert second.json["duplicate"] is True
-    run.assert_called_once()
-    url = main.RESULTS_PATH + "/" + first.json["job_id"]
+    assert second.status_code == 200 and second.json["duplicate"] is True
+    main.dispatch_grok_bot.assert_called_once()
+    url = main.RESULTS_PATH + "/" + processed.json["job_id"]
     assert client.get(url).status_code == 401
     response = client.get(url, headers={"Authorization": "Bearer result-test"})
     assert response.status_code == 200
     assert response.json["analysis"]["decision"] == "Watch"
     assert "secret" not in response.json["alert"]
     with main.redis_client() as store:
-        assert 0 < store.ttl("tv:{" + first.json["job_id"] + "}:result") <= main.RESULT_TTL
+        assert 0 < store.ttl("tv:{" + processed.json["job_id"] + "}:result") <= GROK_RESULT_TTL
 
 
 def test_duplicate_alert_id_cannot_overwrite_result(client, payload):
     payload["alert_id"] = "unique-strategy-event"
-    assert client.post(WORKER, json=queued(payload), headers=AUTH).status_code == 200
+    assert complete(client, payload).status_code == 200
     payload["price"] = 201
     assert client.post(WORKER, json=queued(payload), headers=AUTH).status_code == 409
 
@@ -155,78 +168,25 @@ def test_busy_worker_is_retried(client, payload):
     assert client.post(WORKER, json=queued(payload), headers=AUTH).status_code == 503
 
 
-def test_worker_failure_releases_lock_for_retry(client, payload, monkeypatch):
-    run = MagicMock(side_effect=RuntimeError("sensitive provider response"))
-    monkeypatch.setattr(main, "analyze", run)
+def test_worker_failure_releases_lock_for_retry(client, payload):
+    main.dispatch_grok_bot.side_effect = RuntimeError("sensitive provider response")
     response = client.post(WORKER, json=queued(payload), headers=AUTH)
-    assert response.status_code == 503
-    assert "sensitive" not in response.text
-    run.side_effect = None
-    run.return_value = analysis.watch("No candles")
-    assert client.post(WORKER, json=queued(payload), headers=AUTH).status_code == 200
+    assert response.status_code == 503 and "sensitive" not in response.text
+    main.dispatch_grok_bot.side_effect = None
+    assert client.post(WORKER, json=queued(payload), headers=AUTH).status_code == 202
 
 
-def test_expired_worker_cannot_commit_or_release_new_lock(client, payload, monkeypatch):
+def test_expired_dispatch_worker_cannot_release_new_lock(client, payload):
     alert = Alert.model_validate(queued(payload))
     prefix = "tv:{" + main.job_id_for(alert) + "}:"
-
-    def lose_lock(_):
+    def lose_lock(*args):
         with main.redis_client() as store:
             store.set(prefix + "lock", "new-owner", ex=120)
-        return analysis.watch("No candles")
-
-    monkeypatch.setattr(main, "analyze", lose_lock)
-    assert client.post(WORKER, json=queued(payload), headers=AUTH).status_code == 503
+    main.dispatch_grok_bot.side_effect = lose_lock
+    assert client.post(WORKER, json=queued(payload), headers=AUTH).status_code == 202
     with main.redis_client() as store:
         assert store.get(prefix + "result") is None
         assert store.get(prefix + "lock") == "new-owner"
-
-
-def model_response(payload, **changes):
-    recommendation = analysis.watch("Insufficient market history").model_dump(mode="json")
-    recommendation.update(changes)
-    return SimpleNamespace(
-        status="completed", output_text=json.dumps(recommendation), citations=[],
-        output=[SimpleNamespace(type="web_search_call", status="completed")],
-    )
-
-
-def install_model(monkeypatch, response):
-    sdk = MagicMock()
-    sdk.__enter__.return_value = sdk
-    sdk.responses.create.return_value = response
-    factory = MagicMock(return_value=sdk)
-    monkeypatch.setattr(analysis, "OpenAI", factory)
-    return sdk, factory
-
-
-def test_without_candles_grok_is_asked_to_retrieve_data(payload, monkeypatch):
-    sdk, _ = install_model(monkeypatch, model_response(payload))
-    analysis.analyze(Alert.model_validate(queued(payload)))
-    options = sdk.responses.create.call_args.kwargs
-    assert options["tools"] == [{"type": "web_search"}]
-    assert options["model"] == analysis.DEFAULT_MODEL
-    assert "candles" not in json.loads(options["input"])["alert"]
-    assert "retrieve market evidence" in options["instructions"]
-
-
-def test_model_uses_schema_and_validates_response(payload, monkeypatch):
-    response = model_response(payload)
-    sdk, factory = install_model(monkeypatch, response)
-    result = analysis.analyze(Alert.model_validate(queued(payload)))
-    assert result.decision == "Watch"
-    assert factory.call_args.kwargs["max_retries"] == 0
-    assert sdk.responses.create.call_args.kwargs["text"]["format"]["type"] == "json_schema"
-    response.output_text = '{"decision": "Buy"}'
-    with pytest.raises(ValidationError):
-        analysis.analyze(Alert.model_validate(queued(payload)))
-
-
-def test_buy_requires_consistent_levels():
-    result = analysis.watch("Test").model_dump()
-    result.update(decision="Buy", buy_price=200, stop_loss=210, sell_target=220, time_limit="5 days")
-    with pytest.raises(ValidationError):
-        Recommendation.model_validate(result)
 
 
 def test_job_hash_normalizes_price_and_timezone(payload):
@@ -290,108 +250,17 @@ def test_result_written_between_lookup_and_lock_is_not_recomputed(client, payloa
     real_set = store.set
 
     def acquire_after_completion(key, value, **kwargs):
-        real_set(key.replace(":lock", ":result"), json.dumps({"fingerprint": main.fingerprint(alert)}))
+        real_set(key.replace(":lock", ":result"), json.dumps({"fingerprint": main.fingerprint(alert), "status": "completed"}))
         return real_set(key, value, **kwargs)
 
     monkeypatch.setattr(store, "set", acquire_after_completion)
     monkeypatch.setattr(main, "redis_client", lambda: store)
     run = MagicMock()
-    monkeypatch.setattr(main, "analyze", run)
+    monkeypatch.setattr(main, "dispatch_grok_bot", run)
     response = client.post(WORKER, json=queued(payload), headers=AUTH)
     assert response.status_code == 200
     assert response.json["duplicate"] is True
     run.assert_not_called()
-
-
-def test_stale_queued_alert_skips_model(payload):
-    data = queued(payload)
-    data["time"] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
-    assert "older than" in analysis.analyze(Alert.model_validate(data)).rationale
-    analysis.OpenAI.assert_not_called()
-
-
-def sourced_buy(payload):
-    response = model_response(
-        payload, decision="Buy", buy_price=200, stop_loss=190, sell_target=220,
-        time_limit="5 trading days", market_data_sufficient=True,
-        recommendation_text="RECOMMENDATION\nBuy. Entry 200, stop 190, target 220; 5 trading days.",
-        notification_text="NASDAQ:AAPL — Buy. Daily test; see the full report for evidence and risks.",
-        sources=[{"url": "https://example.com/history", "title": "Market history",
-                  "kind": "market_data", "as_of": payload["time"]}],
-    )
-    response.citations = ["https://example.com/history"]
-    return response
-
-
-def test_cited_fresh_market_evidence_allows_analysis(payload, monkeypatch):
-    install_model(monkeypatch, sourced_buy(payload))
-    result = analysis.analyze(Alert.model_validate(queued(payload)))
-    assert result.decision == "Buy"
-    assert result.market_data_sufficient is True
-    assert result.sources[0].url == "https://example.com/history"
-
-
-@pytest.mark.parametrize("failure", ["no_search", "no_citation", "unknown_time", "stale", "future", "news_only", "insufficient"])
-def test_missing_market_evidence_downgrades_to_watch(payload, monkeypatch, failure):
-    response = sourced_buy(payload)
-    data = json.loads(response.output_text)
-    if failure == "no_search":
-        response.output = []
-    elif failure == "no_citation":
-        response.citations = []
-    elif failure == "unknown_time":
-        data["sources"][0]["as_of"] = None
-    elif failure in ("stale", "future"):
-        days = -8 if failure == "stale" else 1
-        data["sources"][0]["as_of"] = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-    elif failure == "news_only":
-        data["sources"][0]["kind"] = "news"
-    else:
-        data["market_data_sufficient"] = False
-    response.output_text = json.dumps(data)
-    install_model(monkeypatch, response)
-    result = analysis.analyze(Alert.model_validate(queued(payload)))
-    assert result.decision == "Watch"
-    assert result.buy_price is result.stop_loss is result.sell_target is None
-    assert result.market_data_sufficient is False
-
-
-@pytest.mark.parametrize("status", ["incomplete", "failed", "in_progress"])
-def test_incomplete_research_is_retryable(payload, monkeypatch, status):
-    response = model_response(payload)
-    response.status = status
-    install_model(monkeypatch, response)
-    with pytest.raises(ValueError, match="Incomplete"):
-        analysis.analyze(Alert.model_validate(queued(payload)))
-
-
-def test_sdk_wire_contract_with_search_annotation(payload, monkeypatch):
-    from openai import OpenAI
-
-    def handle(request):
-        assert request.url.path == "/v1/responses"
-        data = json.loads(request.content)
-        assert data["tools"] == [{"type": "web_search"}]
-        assert data["store"] is False
-        result = sourced_buy(payload)
-        return httpx.Response(200, json={
-            "id": "resp_test", "object": "response", "created_at": 1,
-            "status": "completed", "model": analysis.DEFAULT_MODEL,
-            "output": [
-                {"id": "search_test", "type": "web_search_call", "status": "completed",
-                 "action": {"type": "search", "query": "AAPL history"}},
-                {"id": "message_test", "type": "message", "role": "assistant", "status": "completed",
-                 "content": [{"type": "output_text", "text": result.output_text,
-                              "annotations": [{"type": "url_citation", "url": "https://example.com/history",
-                                               "title": "Market history", "start_index": 0, "end_index": 1}]}]},
-            ],
-        })
-
-    def factory(**options):
-        return OpenAI(**options, http_client=httpx.Client(transport=httpx.MockTransport(handle)))
-
-    monkeypatch.setattr(analysis, "OpenAI", factory)
-    assert analysis.analyze(Alert.model_validate(queued(payload))).decision == "Buy"
 
 
 @pytest.fixture
@@ -406,7 +275,6 @@ def rich_payload(payload):
 
 
 def test_rich_pine_payload_accepted_and_preserved(client, rich_payload):
-    del rich_payload["price"]  # Accept the original script's close-only price.
     assert client.post(WEBHOOK, json=rich_payload).status_code == 202
     alert = main.publish.call_args.args[0]
     assert alert.price == alert.close == 200.5
@@ -414,10 +282,9 @@ def test_rich_pine_payload_accepted_and_preserved(client, rich_payload):
     assert alert.prevCloses == [199, 198, 197, 196, 195]
 
 
-def test_rich_context_reaches_grok(rich_payload, monkeypatch):
-    sdk, _ = install_model(monkeypatch, model_response(rich_payload))
-    analysis.analyze(Alert.model_validate(queued(rich_payload)))
-    data = json.loads(sdk.responses.create.call_args.kwargs["input"])["alert"]
+def test_rich_context_reaches_bot_worker(client, rich_payload):
+    assert client.post(WORKER, json=queued(rich_payload), headers=AUTH).status_code == 202
+    data = main.dispatch_grok_bot.call_args.args[1].model_dump(mode="json")
     assert data["supertrend"] == 195
     assert data["highest20"] == 205
     assert data["prevCloses"] == [199, 198, 197, 196, 195]
@@ -528,37 +395,11 @@ def test_old_result_routes_removed(client):
     assert client.get("/api/v1/results/" + "a" * 64, headers=RESULT_AUTH).status_code == 404
 
 
-def test_research_timeouts_fit_deployment_and_lock_budget():
+def test_dispatch_queue_and_lock_budget():
     from pathlib import Path
-
     config = json.loads((Path(main.__file__).parent / "vercel.json").read_text())
     duration = config["functions"]["main.py"]["maxDuration"]
-    assert analysis.XAI_CONNECT_TIMEOUT_SECONDS + analysis.XAI_TIMEOUT_SECONDS + 20 < duration
-    assert duration < main.QSTASH_DELIVERY_TIMEOUT < main.LOCK_TTL
-
-
-def test_sdk_timeout_is_retryable_and_logged_without_credentials(client, payload, monkeypatch, caplog):
-    from openai import OpenAI
-
-    def handle(request):
-        raise httpx.ReadTimeout("sensitive response details", request=request)
-
-    def factory(**options):
-        assert options["timeout"].read == analysis.XAI_TIMEOUT_SECONDS
-        assert options["timeout"].connect == analysis.XAI_CONNECT_TIMEOUT_SECONDS
-        return OpenAI(**options, http_client=httpx.Client(transport=httpx.MockTransport(handle)))
-
-    monkeypatch.setattr(analysis, "OpenAI", factory)
-    monkeypatch.setattr(main, "analyze", analysis.analyze)
-    response = client.post(WORKER, json=queued(payload), headers=AUTH)
-    assert response.status_code == 503
-    assert "APITimeoutError" in caplog.text
-    assert "stage=analysis" in caplog.text
-    assert "elapsed_seconds=" in caplog.text
-    assert "cause=ReadTimeout" in caplog.text
-    assert "sensitive response details" not in caplog.text + response.text
-    with main.redis_client() as store:
-        assert store.get("tv:{" + main.job_id_for(Alert.model_validate(queued(payload))) + "}:lock") is None
+    assert 10 < duration < main.QSTASH_DELIVERY_TIMEOUT < main.LOCK_TTL
 
 
 @pytest.fixture
@@ -580,12 +421,11 @@ def enriched_payload(rich_payload):
     return rich_payload
 
 
-def test_enriched_alert_accepted_and_sent_to_grok(client, enriched_payload, monkeypatch):
+def test_enriched_alert_accepted_and_sent_to_bot(client, enriched_payload):
     assert client.post(WEBHOOK, json=enriched_payload).status_code == 202
     alert = main.publish.call_args.args[0]
-    sdk, _ = install_model(monkeypatch, model_response(enriched_payload))
-    analysis.analyze(alert)
-    data = json.loads(sdk.responses.create.call_args.kwargs["input"])["alert"]
+    assert client.post(WORKER, json=queued(enriched_payload), headers=AUTH).status_code == 202
+    data = main.dispatch_grok_bot.call_args.args[1].model_dump(mode="json")
     assert data["currency"] == "USD"
     assert data["is_standard_chart"] is True
     assert data["bar_confirmed"] is True
@@ -624,10 +464,8 @@ def test_indicator_parameters_are_validated(client, enriched_payload, changes):
     assert client.post(WEBHOOK, json=enriched_payload).status_code == 400
 
 
-def test_result_has_structured_and_readable_views(client, enriched_payload, monkeypatch):
-    run = MagicMock(return_value=analysis.watch("No reliable intraday history found."))
-    monkeypatch.setattr(main, "analyze", run)
-    processed = client.post(WORKER, json=queued(enriched_payload), headers=AUTH)
+def test_result_has_structured_and_readable_views(client, enriched_payload):
+    processed = complete(client, enriched_payload, watch("No reliable intraday history found."))
     assert processed.status_code == 200
     path = main.RESULTS_PATH + "/" + processed.json["job_id"]
     response = client.get(path, headers=RESULT_AUTH)
@@ -636,61 +474,14 @@ def test_result_has_structured_and_readable_views(client, enriched_payload, monk
     assert response.json["recommendation_text"].startswith("WATCH")
     assert "No reliable intraday history found." in response.json["recommendation_text"]
     plain = client.get(path + "?format=text", headers=RESULT_AUTH)
-    assert plain.status_code == 200
-    assert plain.mimetype == "text/plain"
+    assert plain.status_code == 200 and plain.mimetype == "text/plain"
     assert plain.headers["Cache-Control"] == "no-store"
     assert plain.text == response.json["recommendation_text"]
     assert client.get(path + "?format=text").status_code == 401
     assert client.get(path + "?format=html", headers=RESULT_AUTH).status_code == 400
-    run.assert_called_once()
 
 
-def test_old_results_remain_json_without_recreating_reports(client):
-    job_id = "b" * 64
-    key = "tv:{" + job_id + "}:result"
-    original = json.dumps({"job_id": job_id, "alert": {"ticker": "NASDAQ:AAPL", "signal": "green"},
-                           "analysis": {"decision": "Watch", "rationale": "Legacy analysis"}})
-    with main.redis_client() as store:
-        store.set(key, original, ex=100)
-    response = client.get(main.RESULTS_PATH + "/" + job_id, headers=RESULT_AUTH)
-    assert response.status_code == 200
-    assert response.json["recommendation_text"] is None
-    assert response.json["analysis"]["rationale"] == "Legacy analysis"
-    assert client.get(main.RESULTS_PATH + "/" + job_id + "?format=text", headers=RESULT_AUTH).status_code == 409
-    with main.redis_client() as store:
-        assert store.get(key) == original
-
-
-@pytest.mark.parametrize("explicit_id, expected", [
-    (False, "e6b83bba82a94e808e4a2fccef4ed49db6bfd2fe9044bcc1169d10981cf77c4a"),
-    (True, "f19fd8d455ab9d44628fbcae7774b0000637db5e0b9613daf13a5a035ad46687"),
-])
-def test_pre_upgrade_alert_identity_is_preserved(explicit_id, expected):
-    # Fixed reference fingerprints from the deployed pre-context schema.
-    data = {"ticker": "NASDAQ:AAPL", "signal": "green", "price": 200.5,
-            "interval": "5", "time": "2026-11-27T15:00:00Z"}
-    if explicit_id:
-        data["alert_id"] = "compatibility-check"
-    alert = Alert.model_validate(data)
-    assert main.fingerprint(alert) == expected
-    if not explicit_id:
-        assert main.job_id_for(alert) == expected
-    data.update(currency=None, atr=None)
-    assert main.fingerprint(Alert.model_validate(data)) == expected
-    data["currency"] = "USD"
-    assert main.fingerprint(Alert.model_validate(data)) != expected
-
-
-def test_pre_upgrade_completed_job_is_not_reanalyzed(client):
-    data = {"alert_id": "compatibility-check", "ticker": "NASDAQ:AAPL", "signal": "green",
-            "price": 200.5, "interval": "5", "time": "2026-11-27T15:00:00Z"}
-    job_id = main.job_id_for(Alert.model_validate(data))
-    with main.redis_client() as store:
-        store.set("tv:{" + job_id + "}:result", json.dumps({
-            "fingerprint": "f19fd8d455ab9d44628fbcae7774b0000637db5e0b9613daf13a5a035ad46687",
-            "alert": data, "analysis": {"decision": "Watch"},
-        }))
-    response = client.post(WORKER, json=data, headers=AUTH)
-    assert response.status_code == 200
-    assert response.json["duplicate"] is True
-    main.analyze.assert_not_called()
+def test_close_only_payload_is_not_accepted_as_price(client, rich_payload):
+    del rich_payload["price"]
+    assert client.post(WEBHOOK, json=rich_payload).status_code == 400
+    main.publish.assert_not_called()

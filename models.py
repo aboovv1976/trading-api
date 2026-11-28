@@ -77,12 +77,6 @@ class Alert(BaseModel):
     avgClose20: Optional[Price] = None
     prevCloses: Optional[Annotated[list[Optional[Price]], Field(min_length=5, max_length=5)]] = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def use_close_as_price(cls, data):
-        if isinstance(data, dict) and "price" not in data and "close" in data:
-            return {**data, "price": data["close"]}
-        return data
 
     _iso_time = field_validator("time", mode="before")(iso_timestamp)
     _utc_time = field_validator("time")(timezone_required)
@@ -141,26 +135,36 @@ class Source(BaseModel):
     _utc_time = field_validator("as_of")(lambda value: timezone_required(value) if value else None)
 
 
-class Recommendation(BaseModel):
+class EntryRange(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    low: Price
+    high: Price
+
+    @model_validator(mode="after")
+    def ordered(self):
+        if self.low > self.high:
+            raise ValueError("Entry range low must not exceed high")
+        return self
+
+
+class TradeTarget(BaseModel):
+    model_config = ConfigDict(extra="allow", strict=True)
+    price: Price
+    reason: Annotated[str, Field(max_length=2000)] | None = None
+
+
+class AnalysisView(BaseModel):
+    """Validated app decision and display fields derived from a rich bot result."""
     model_config = ConfigDict(extra="forbid", strict=True)
 
     decision: Literal["Buy", "Watch", "Avoid"]
-    buy_price: Optional[Price]
-    stop_loss: Optional[Price]
-    sell_target: Optional[Price]
-    time_limit: Optional[Annotated[str, Field(max_length=200)]]
+    entry_range: EntryRange | None
+    stop_loss: Price | None
+    targets: Annotated[list[TradeTarget], Field(max_length=20)]
+    time_limit_days: Annotated[int, Field(gt=0, le=3650)] | None
     rationale: Annotated[str, Field(min_length=1, max_length=2000)]
     limitations: Annotated[list[Annotated[str, Field(max_length=500)]], Field(max_length=20)]
     market_data_sufficient: bool
     sources: Annotated[list[Source], Field(max_length=20)]
     recommendation_text: Annotated[str, Field(min_length=1, max_length=12000)]
     notification_text: Annotated[str, Field(min_length=1, max_length=300)]
-
-    @model_validator(mode="after")
-    def valid_levels(self):
-        if self.decision == "Buy":
-            if any(value is None for value in (self.buy_price, self.stop_loss, self.sell_target)) or not self.time_limit:
-                raise ValueError("Buy requires price levels and a time limit")
-            if not self.stop_loss < self.buy_price < self.sell_target:
-                raise ValueError("Expected stop_loss < buy_price < sell_target")
-        return self

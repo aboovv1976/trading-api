@@ -13,38 +13,21 @@ from flask import Flask, Response, jsonify, render_template, request
 from pydantic import ValidationError
 from redis import Redis
 
-from analysis import analyze
+from grok_bot import create_blueprint as create_grok_blueprint
+from grok_bot import dispatch as dispatch_grok_bot
 from models import Alert
 from reports import REPORTS_PATH, valid_job_id, valid_report_signature, with_report
 from whatsapp import create_blueprint as create_whatsapp_blueprint
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024
-RESULT_TTL = 7 * 24 * 60 * 60
 LOCK_TTL = 360  # Longer than the configured 300-second Vercel invocation.
 QSTASH_DELIVERY_TIMEOUT = 330  # Allows for invocation startup and shutdown.
 RESULTS_PATH = "/api/v1/results-8dc2a850b73dc31d"
-# These fields were added after the original alert identity format. Omitting
-# absent context preserves IDs/fingerprints for pre-upgrade queued alerts.
-ADDITIONAL_CONTEXT_FIELDS = frozenset({
-    "strategy_id", "script_version", "currency", "instrument_type", "exchange_timezone",
-    "chart_session", "session_state", "is_standard_chart", "bar_confirmed",
-    "bar_open_time", "bar_close_time", "atr", "atr_pct", "di_plus", "di_minus",
-    "indicator_settings",
-})
-
-# A timed-out worker cannot release another delivery's lock or overwrite its result.
+# A timed-out dispatch worker cannot release another delivery's lock.
 RELEASE = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
     return redis.call('del', KEYS[1])
-end
-return 0
-"""
-COMPLETE = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
-    redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3])
-    redis.call('del', KEYS[1])
-    return 1
 end
 return 0
 """
@@ -76,14 +59,11 @@ def redis_client():
 
 
 app.register_blueprint(create_whatsapp_blueprint(lambda: redis_client()))
+app.register_blueprint(create_grok_blueprint(lambda: redis_client()))
 
 
 def canonical(alert):
-    data = alert.model_dump(mode="json")
-    for field in ADDITIONAL_CONTEXT_FIELDS:
-        if data[field] is None:
-            del data[field]
-    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+    return json.dumps(alert.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
 
 
 def fingerprint(alert):
@@ -149,7 +129,7 @@ def tradingview_webhook():
 
 @app.post("/api/v1/analyze-e8f8323f5eecdfce")
 def analysis_worker():
-    if not configured("WORKER_TOKEN", "REDIS_URL", "XAI_API_KEY"):
+    if not configured("WORKER_TOKEN", "REDIS_URL", "GROK_WEBHOOK_URL", "GROK_WEBHOOK_KEY", "GROK_CALLBACK_TOKEN"):
         return jsonify(error="Server misconfigured"), 503
     if not bearer_authorized("WORKER_TOKEN"):
         return jsonify(error="Unauthorized"), 401
@@ -170,9 +150,14 @@ def analysis_worker():
         store = redis_client()
         existing = store.get(result_key)
         if existing:
-            if json.loads(existing)["fingerprint"] != fingerprint(alert):
+            existing_record = json.loads(existing)
+            if existing_record["fingerprint"] != fingerprint(alert):
                 return jsonify(error="alert_id already used for different data"), 409
-            return jsonify(status="completed", job_id=job_id, duplicate=True), 200
+            return jsonify(status=existing_record["status"], job_id=job_id, duplicate=True), 200
+        pending = store.get(prefix + "bot_pending")
+        if pending:
+            if json.loads(pending)["fingerprint"] != fingerprint(alert):
+                return jsonify(error="alert_id already used for different data"), 409
         stage = "redis_lock"
         acquired = bool(store.set(lock_key, owner, nx=True, ex=LOCK_TTL))
         if not acquired:
@@ -180,22 +165,13 @@ def analysis_worker():
         # Another invocation may have completed between the first GET and SET NX.
         existing = store.get(result_key)
         if existing:
-            if json.loads(existing)["fingerprint"] != fingerprint(alert):
+            existing_record = json.loads(existing)
+            if existing_record["fingerprint"] != fingerprint(alert):
                 return jsonify(error="alert_id already used for different data"), 409
-            return jsonify(status="completed", job_id=job_id, duplicate=True), 200
-        stage = "analysis"
-        result = {
-            "job_id": job_id, "fingerprint": fingerprint(alert),
-            "alert": alert.model_dump(mode="json"),
-            "analysis": analyze(alert).model_dump(mode="json"),
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        stage = "redis_commit"
-        if not store.eval(COMPLETE, 2, lock_key, result_key, owner, json.dumps(result), RESULT_TTL):
-            raise RuntimeError("Worker lease expired")
-        acquired = False
-        app.logger.info("Analysis stored job_id=%s", job_id)
-        return jsonify(status="completed", job_id=job_id), 200
+            return jsonify(status=existing_record["status"], job_id=job_id, duplicate=True), 200
+        stage = "bot_dispatch"
+        dispatch_grok_bot(store, alert, job_id, fingerprint(alert))
+        return jsonify(status="awaiting_callback", job_id=job_id), 202
     except Exception as exc:
         app.logger.error(
             "Analysis failed job_id=%s (%s) stage=%s elapsed_seconds=%.3f cause=%s",
@@ -319,6 +295,7 @@ def view_report(job_id):
             "report.html", record=record,
             alert_json=json.dumps(record.get("alert", {}), indent=2, ensure_ascii=False),
             analysis_json=json.dumps(record["analysis"], indent=2, ensure_ascii=False),
+            bot_response_json=json.dumps(record["bot_response"], indent=2, ensure_ascii=False) if "bot_response" in record else None,
         ), mimetype="text/html")
         response.headers["Content-Security-Policy"] = (
             "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "

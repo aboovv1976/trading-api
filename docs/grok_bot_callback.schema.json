@@ -1,0 +1,459 @@
+{
+  "$defs": {
+    "BotRejection": {
+      "additionalProperties": false,
+      "properties": {
+        "job_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Job Id",
+          "type": "string"
+        },
+        "status": {
+          "const": "rejected",
+          "title": "Status",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "status",
+        "reason"
+      ],
+      "title": "BotRejection",
+      "type": "object"
+    },
+    "EntryRange": {
+      "additionalProperties": false,
+      "properties": {
+        "low": {
+          "exclusiveMinimum": 0,
+          "title": "Low",
+          "type": "number"
+        },
+        "high": {
+          "exclusiveMinimum": 0,
+          "title": "High",
+          "type": "number"
+        }
+      },
+      "required": [
+        "low",
+        "high"
+      ],
+      "title": "EntryRange",
+      "type": "object"
+    },
+    "RichBotCallback": {
+      "additionalProperties": true,
+      "properties": {
+        "job_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Job Id",
+          "type": "string"
+        },
+        "status": {
+          "const": "completed",
+          "title": "Status",
+          "type": "string"
+        },
+        "ticker": {
+          "maxLength": 40,
+          "minLength": 1,
+          "title": "Ticker",
+          "type": "string"
+        },
+        "signal": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Signal"
+        },
+        "bias": {
+          "anyOf": [
+            {
+              "maxLength": 100,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bias"
+        },
+        "timeframe": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeframe"
+        },
+        "alert_price": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Alert Price"
+        },
+        "alert_time": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Alert Time"
+        },
+        "analyzed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Analyzed At"
+        },
+        "watchlist": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Watchlist"
+        },
+        "recommendation": {
+          "$ref": "#/$defs/TradePlan"
+        },
+        "analysis": {
+          "additionalProperties": true,
+          "title": "Analysis",
+          "type": "object"
+        },
+        "reasons": {
+          "items": {
+            "maxLength": 2000,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "title": "Reasons",
+          "type": "array"
+        },
+        "main_risk": {
+          "anyOf": [
+            {
+              "maxLength": 2000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Main Risk"
+        },
+        "risk_rules_used": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Risk Rules Used"
+        },
+        "summary": {
+          "maxLength": 12000,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "disclaimer": {
+          "anyOf": [
+            {
+              "maxLength": 2000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Disclaimer"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/Source"
+          },
+          "maxItems": 20,
+          "title": "Sources",
+          "type": "array"
+        },
+        "market_data_sufficient": {
+          "default": false,
+          "title": "Market Data Sufficient",
+          "type": "boolean"
+        },
+        "recommendation_text": {
+          "maxLength": 12000,
+          "minLength": 1,
+          "title": "Recommendation Text",
+          "type": "string"
+        },
+        "notification_text": {
+          "maxLength": 300,
+          "minLength": 1,
+          "title": "Notification Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "status",
+        "ticker",
+        "recommendation",
+        "analysis",
+        "summary",
+        "recommendation_text",
+        "notification_text"
+      ],
+      "title": "RichBotCallback",
+      "type": "object"
+    },
+    "Source": {
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "maxLength": 2000,
+          "pattern": "^https?://[^\\s]+$",
+          "title": "Url",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 300,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "market_data",
+            "news",
+            "sentiment"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "as_of": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "As Of"
+        }
+      },
+      "required": [
+        "url",
+        "title",
+        "kind",
+        "as_of"
+      ],
+      "title": "Source",
+      "type": "object"
+    },
+    "TradePlan": {
+      "additionalProperties": true,
+      "properties": {
+        "action": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Action",
+          "type": "string"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "maxLength": 100,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confidence"
+        },
+        "entry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntryRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "stop_loss": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop Loss"
+        },
+        "stop_reason": {
+          "anyOf": [
+            {
+              "maxLength": 2000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stop Reason"
+        },
+        "targets": {
+          "items": {
+            "$ref": "#/$defs/TradeTarget"
+          },
+          "maxItems": 20,
+          "title": "Targets",
+          "type": "array"
+        },
+        "reward_to_risk": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reward To Risk"
+        },
+        "time_limit_days": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 3650,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Time Limit Days"
+        },
+        "position_size": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Position Size"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "TradePlan",
+      "type": "object"
+    },
+    "TradeTarget": {
+      "additionalProperties": true,
+      "properties": {
+        "price": {
+          "exclusiveMinimum": 0,
+          "title": "Price",
+          "type": "number"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 2000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        }
+      },
+      "required": [
+        "price"
+      ],
+      "title": "TradeTarget",
+      "type": "object"
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "#/$defs/RichBotCallback"
+    },
+    {
+      "$ref": "#/$defs/BotRejection"
+    }
+  ]
+}

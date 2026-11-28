@@ -13,6 +13,7 @@ from whatsapp import EVENT_TTL, MAX_PAYLOAD_BYTES, WHATSAPP_PATH
 def inbox(monkeypatch):
     monkeypatch.setenv("WHATSAPP_VERIFY_TOKEN", "verify-test")
     monkeypatch.setenv("WHATSAPP_APP_SECRET", "app-secret-test")
+    monkeypatch.setenv("WHATSAPP_ALLOWED_NUMBERS", "15555550123")
     monkeypatch.setenv("REDIS_URL", "redis://unused")
     server = fakeredis.FakeServer()
     factory = lambda: fakeredis.FakeRedis(server=server, decode_responses=True)
@@ -24,7 +25,7 @@ def inbox(monkeypatch):
 def event():
     return {"object": "whatsapp_business_account", "entry": [{"id": "account-test", "changes": [{
         "field": "messages", "value": {"metadata": {"phone_number_id": "business-test"},
-        "messages": [{"id": "wamid.test", "from": "sender-test", "type": "text", "text": {"body": "Hello"}}]},
+        "messages": [{"id": "wamid.test", "from": "15555550123", "type": "text", "text": {"body": "Hello"}}]},
     }]}]}
 
 
@@ -101,8 +102,8 @@ def test_duplicate_envelope_not_overwritten_or_expiry_extended(inbox):
 def test_delivery_statuses_and_unknown_message_types_preserved(inbox):
     payload = event()
     value = payload["entry"][0]["changes"][0]["value"]
-    value["statuses"] = [{"id": "wamid.outgoing", "status": "delivered"}]
-    value["messages"][0] = {"id": "wamid.new", "type": "future_type", "user_id": "opaque-id"}
+    value["statuses"] = [{"id": "wamid.outgoing", "status": "delivered", "recipient_id": "15555550123"}]
+    value["messages"][0] = {"id": "wamid.new", "type": "future_type", "user_id": "opaque-id", "from": "15555550123"}
     response = deliver(inbox[0], payload)
     assert response.status_code == 200
     with inbox[1]() as store:
@@ -142,7 +143,7 @@ def test_storage_error_requests_retry_without_logging_content(inbox, monkeypatch
     response = deliver(inbox[0])
     assert response.status_code == 503
     assert "private-credential" not in caplog.text
-    assert "sender-test" not in caplog.text
+    assert "15555550123" not in caplog.text
     assert "Hello" not in caplog.text
 
 

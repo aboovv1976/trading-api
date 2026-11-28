@@ -7,9 +7,10 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import fakeredis
 import pytest
 
-import analysis
+from recommendations import watch
 import main
-from models import Recommendation
+from grok_bot import TTL as GROK_RESULT_TTL
+from models import AnalysisView
 from reports import REPORTS_PATH, REPORT_LIFETIME, signature
 
 AUTH = {"Authorization": "Bearer result-test"}
@@ -23,7 +24,7 @@ def setup(monkeypatch):
     monkeypatch.setenv("WORKER_URL", "https://production.example/api/v1/analyze-hidden")
     server = fakeredis.FakeServer()
     monkeypatch.setattr(main, "redis_client", lambda: fakeredis.FakeRedis(server=server, decode_responses=True))
-    recommendation = analysis.watch("Not enough evidence.").model_dump(mode="json")
+    recommendation = watch("Not enough evidence.").model_dump(mode="json")
     recommendation.update(
         recommendation_text="TRIGGER\nReported green flip.\nINPUTS\nNASDAQ:NVDA\nRECOMMENDATION\nWatch.\nRISKS AND LIMITATIONS\nInsufficient data.\nSOURCES\nNone.",
         notification_text="NVDA — Watch. Insufficient evidence for the 5-minute alert.",
@@ -141,7 +142,7 @@ def test_links_do_not_extend_retention_or_trust_host_header(setup):
 
 
 def test_report_link_lifetime_matches_result_storage():
-    assert REPORT_LIFETIME == main.RESULT_TTL
+    assert REPORT_LIFETIME == GROK_RESULT_TTL
 
 
 def test_existing_json_and_text_views_use_model_report(setup):
@@ -155,22 +156,8 @@ def test_existing_json_and_text_views_use_model_report(setup):
     assert response.json["results"][0]["report_url"]
 
 
-def test_legacy_json_available_but_no_formatter_or_link(setup):
-    client, record = setup
-    del record["analysis"]["recommendation_text"]
-    del record["analysis"]["notification_text"]
-    with main.redis_client() as store:
-        store.set("tv:{" + JOB + "}:result", json.dumps(record))
-    response = client.get(main.RESULTS_PATH + "/" + JOB, headers=AUTH)
-    assert response.status_code == 200
-    assert response.json["report_url"] is None
-    assert response.json["recommendation_text"] is None
-    assert client.post(REPORTS_PATH + "/" + JOB + "/link", headers=AUTH).status_code == 409
-    assert client.get(main.RESULTS_PATH + "/" + JOB + "?format=text", headers=AUTH).status_code == 409
-
-
 def test_new_analysis_requires_model_written_text():
-    data = analysis.watch("Test").model_dump()
+    data = watch("Test").model_dump()
     del data["notification_text"]
     with pytest.raises(ValueError):
-        Recommendation.model_validate(data)
+        AnalysisView.model_validate(data)
